@@ -1,0 +1,10 @@
+services:
+  eh-telegram-archive:
+    build: .
+    image: eh-telegram-archive:local
+    env_file: .env
+    environment:
+      DOWNLOAD_DIR: /downloads
+    volumes:
+      - ./downloads:/downloads
+    restart: unless-stopped
