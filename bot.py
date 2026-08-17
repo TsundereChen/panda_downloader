@@ -1,7 +1,8 @@
-"""Telegram-controlled archive downloader for E-Hentai and ExHentai.
+"""Private Telegram-controlled archive downloader for E-Hentai and ExHentai.
 
-The bot requests the site's own archive, then saves the completed archive to a
-local directory. It deliberately does not scrape individual gallery images.
+Only explicitly allow-listed Telegram users in private chats can interact with
+the bot. Archives are requested from the site's own archiver and saved locally;
+individual gallery images are never scraped or uploaded to Telegram.
 """
 
 from __future__ import annotations
@@ -10,91 +11,205 @@ import asyncio
 import logging
 import os
 import re
-import secrets
+import shutil
 import time
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 from urllib.parse import urljoin, urlparse
+from uuid import uuid4
 
 import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    Update,
+)
+from telegram.constants import ChatAction, ChatType
+from telegram.error import NetworkError, RetryAfter, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 LOG = logging.getLogger(__name__)
-GALLERY_RE: Final = re.compile(
-    r"^https?://(?P<host>e-hentai\.org|exhentai\.org)/g/(?P<gid>\d+)/(?P<token>[0-9a-fA-F]+)/?",
-    re.IGNORECASE,
-)
+SUPPORTED_GALLERY_HOSTS: Final = frozenset({"e-hentai.org", "exhentai.org"})
+KNOWN_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash", "igneous"})
+GALLERY_PATH_RE: Final = re.compile(r"^/g/(?P<gid>\d+)/(?P<token>[0-9a-fA-F]+)/?$")
 SAFE_FILENAME_RE: Final = re.compile(r"[^\w.()\[\] -]+", re.UNICODE)
+HOSTNAME_RE: Final = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 AUTH_FAILURE_MARKERS: Final = (
     "you are not logged in",
     "please log in",
     "invalid login",
     "log in to continue",
 )
+RETRYABLE_STATUS_CODES: Final = frozenset({429, 500, 502, 503, 504})
+MAX_HTML_BYTES: Final = 2 * 1024 * 1024
+CONFIRMATION_TTL_SECONDS: Final = 10 * 60
+PROGRESS_UPDATE_SECONDS: Final = 2.0
+ARCHIVE_SIGNATURES: Final = (
+    (b"PK\x03\x04", ".zip"),
+    (b"PK\x05\x06", ".zip"),
+    (b"PK\x07\x08", ".zip"),
+    (b"Rar!\x1a\x07", ".rar"),
+    (b"7z\xbc\xaf\x27\x1c", ".7z"),
+)
+ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+def _positive_float_env(name: str, default: str) -> float:
+    try:
+        value = float(os.getenv(name, default))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be numeric") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
+def _positive_int_env(name: str, default: str) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
+def _parse_allowed_hosts(raw_hosts: str) -> frozenset[str]:
+    hosts = set(SUPPORTED_GALLERY_HOSTS)
+    for item in raw_hosts.split(","):
+        host = item.strip().lower().rstrip(".")
+        if not host:
+            continue
+        if "://" in host or not HOSTNAME_RE.fullmatch(host):
+            raise RuntimeError(
+                "ARCHIVE_DOWNLOAD_HOSTS must contain comma-separated hostnames"
+            )
+        hosts.add(host)
+    return frozenset(hosts)
 
 
 @dataclass(frozen=True)
 class Settings:
     token: str
     allowed_user_ids: frozenset[int]
-    access_password: str
     cookie_header: str
     download_dir: Path
     archive_type: str
     max_archive_bytes: int
+    max_total_bytes: int
+    min_free_bytes: int
     wait_seconds: int
+    queue_size: int
+    archive_download_hosts: frozenset[str]
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         load_dotenv()
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         if not token:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
-        archive_type = os.getenv("ARCHIVE_TYPE", "org").strip().lower()
-        if archive_type not in {"org", "res"}:
-            raise RuntimeError("ARCHIVE_TYPE must be org or res")
+
         try:
             allowed = frozenset(
                 int(item.strip())
                 for item in os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").split(",")
                 if item.strip()
             )
-            max_gib = float(os.getenv("MAX_ARCHIVE_GIB", "8"))
-            wait_minutes = float(os.getenv("ARCHIVE_WAIT_MINUTES", "30"))
         except ValueError as exc:
-            raise RuntimeError("Invalid numeric setting in .env") from exc
-        if max_gib <= 0 or wait_minutes <= 0:
-            raise RuntimeError("MAX_ARCHIVE_GIB and ARCHIVE_WAIT_MINUTES must be positive")
+            raise RuntimeError(
+                "ALLOWED_TELEGRAM_USER_IDS must contain numeric Telegram user IDs"
+            ) from exc
+        if not allowed or any(user_id <= 0 for user_id in allowed):
+            raise RuntimeError(
+                "ALLOWED_TELEGRAM_USER_IDS must contain at least one positive Telegram user ID"
+            )
+
+        archive_type = os.getenv("ARCHIVE_TYPE", "org").strip().lower()
+        if archive_type not in {"org", "res"}:
+            raise RuntimeError("ARCHIVE_TYPE must be org or res")
+
+        max_archive_gib = _positive_float_env("MAX_ARCHIVE_GIB", "8")
+        max_total_gib = _positive_float_env("MAX_TOTAL_DOWNLOAD_GIB", "64")
+        if max_total_gib < max_archive_gib:
+            raise RuntimeError(
+                "MAX_TOTAL_DOWNLOAD_GIB must be at least MAX_ARCHIVE_GIB"
+            )
+
         return cls(
             token=token,
             allowed_user_ids=allowed,
-            access_password=os.getenv("BOT_ACCESS_PASSWORD", ""),
-            cookie_header=os.getenv("EH_COOKIE", ""),
-            download_dir=Path(os.getenv("DOWNLOAD_DIR", "./downloads")).expanduser().resolve(),
+            cookie_header=os.getenv("EH_COOKIE", "").strip(),
+            download_dir=Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
+            .expanduser()
+            .resolve(),
             archive_type=archive_type,
-            max_archive_bytes=int(max_gib * 1024**3),
-            wait_seconds=int(wait_minutes * 60),
+            max_archive_bytes=int(max_archive_gib * 1024**3),
+            max_total_bytes=int(max_total_gib * 1024**3),
+            min_free_bytes=int(_positive_float_env("MIN_FREE_DISK_GIB", "1") * 1024**3),
+            wait_seconds=int(_positive_float_env("ARCHIVE_WAIT_MINUTES", "30") * 60),
+            queue_size=_positive_int_env("JOB_QUEUE_SIZE", "20"),
+            archive_download_hosts=_parse_allowed_hosts(
+                os.getenv("ARCHIVE_DOWNLOAD_HOSTS", "")
+            ),
         )
 
 
 def parse_gallery_url(raw_url: str) -> tuple[str, str, str]:
-    """Return (host, gid, token), accepting only supported canonical URLs."""
-    match = GALLERY_RE.match(raw_url.strip())
-    if not match:
-        raise ValueError("Send a full E-Hentai or ExHentai gallery URL (…/g/<id>/<token>/).")
-    return match.group("host").lower(), match.group("gid"), match.group("token").lower()
+    """Return (host, gid, token), accepting only a complete canonical URL."""
+    parsed = urlparse(raw_url.strip())
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("The gallery URL contains an invalid port.") from exc
+    host = (parsed.hostname or "").lower().rstrip(".")
+    path_match = GALLERY_PATH_RE.fullmatch(parsed.path)
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or host not in SUPPORTED_GALLERY_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 80, 443}
+        or path_match is None
+    ):
+        raise ValueError(
+            "Send a full E-Hentai or ExHentai gallery URL (…/g/<id>/<token>/)."
+        )
+    return host, path_match.group("gid"), path_match.group("token").lower()
+
+
+def extract_gallery_url(text: str) -> str | None:
+    """Return the first valid gallery URL in a message."""
+    for candidate in re.findall(r"https?://[^\s<>]+", text, flags=re.IGNORECASE):
+        candidate = candidate.rstrip(".,;:!?)]}'\"")
+        try:
+            parse_gallery_url(candidate)
+        except ValueError:
+            continue
+        return candidate
+    return None
 
 
 def parse_cookie_header(header: str) -> dict[str, str]:
     cookies: dict[str, str] = {}
     for part in header.split(";"):
-        name, sep, value = part.strip().partition("=")
-        if sep and name and value:
+        name, separator, value = part.strip().partition("=")
+        if separator and name in KNOWN_COOKIE_NAMES and value:
             cookies[name] = value
     return cookies
 
@@ -106,64 +221,152 @@ def safe_filename(name: str, fallback: str) -> str:
 
 def filename_from_response(response: httpx.Response, fallback: str) -> str:
     disposition = response.headers.get("content-disposition", "")
-    match = re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.I)
+    match = re.search(
+        r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.IGNORECASE
+    )
     return safe_filename(match.group(1) if match else fallback, fallback)
 
 
 def is_archive_response(response: httpx.Response) -> bool:
     content_type = response.headers.get("content-type", "").lower()
     disposition = response.headers.get("content-disposition", "").lower()
-    return "attachment" in disposition or any(kind in content_type for kind in ("zip", "rar", "7z", "octet-stream"))
+    return "attachment" in disposition or any(
+        archive_type in content_type
+        for archive_type in ("zip", "rar", "7z", "octet-stream")
+    )
 
 
-def archive_link_from_html(html: str, page_url: str) -> str | None:
-    """Find the completed-download link without trusting arbitrary page links."""
+def host_is_allowed(host: str | None, allowed_hosts: frozenset[str]) -> bool:
+    normalized = (host or "").lower().rstrip(".")
+    return any(
+        normalized == allowed or normalized.endswith(f".{allowed}")
+        for allowed in allowed_hosts
+    )
+
+
+def validate_outbound_url(url: str, allowed_hosts: frozenset[str]) -> str:
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("The site returned an invalid download URL.") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or not host_is_allowed(parsed.hostname, allowed_hosts)
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+    ):
+        raise RuntimeError(
+            "The site returned a download URL outside the configured host allow-list."
+        )
+    return url
+
+
+def archive_link_from_html(
+    html: str, page_url: str, allowed_hosts: frozenset[str] = SUPPORTED_GALLERY_HOSTS
+) -> str | None:
+    """Find a completed archive link while enforcing the outbound host policy."""
     soup = BeautifulSoup(html, "html.parser")
     for anchor in soup.select("a[href]"):
         href = urljoin(page_url, anchor["href"])
         parsed = urlparse(href)
         text = anchor.get_text(" ", strip=True).lower()
-        if parsed.scheme != "https":
-            continue
-        if any(word in text for word in ("download", "click here", "archive")) or re.search(
-            r"\.(zip|rar|7z)(?:$|[?#])", parsed.path, re.I
+        if parsed.scheme.lower() != "https" or not host_is_allowed(
+            parsed.hostname, allowed_hosts
         ):
+            continue
+        if any(
+            word in text for word in ("download", "click here", "archive")
+        ) or re.search(r"\.(zip|rar|7z)(?:$|[?#])", parsed.path, re.IGNORECASE):
             return href
     return None
 
 
+def archive_format(path: Path) -> str | None:
+    with path.open("rb") as archive_file:
+        header = archive_file.read(8)
+    for signature, suffix in ARCHIVE_SIGNATURES:
+        if header.startswith(signature):
+            return suffix
+    return None
+
+
+def format_bytes(byte_count: int) -> str:
+    value = float(byte_count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            precision = 0 if unit == "B" else 1
+            return f"{value:.{precision}f} {unit}"
+        value /= 1024
+    raise AssertionError("unreachable")
+
+
+def download_progress_message(filename: str, downloaded: int, total: int | None) -> str:
+    if total is not None and total > 0:
+        percentage = min(100, int(downloaded * 100 / total))
+        return (
+            f"⬇️ Downloading {filename}\n"
+            f"{percentage}% — {format_bytes(downloaded)} / {format_bytes(total)}"
+        )
+    return f"⬇️ Downloading {filename}\nReceived {format_bytes(downloaded)}"
+
+
+@dataclass
+class ArchiveJob:
+    url: str
+    notice: Message
+    user_id: int
+
+
+@dataclass(frozen=True)
+class PendingDownload:
+    url: str
+    user_id: int
+    created_at: float
+
+
 class ArchiveClient:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
         self.settings = settings
+        self.transport = transport
 
     def _client(self) -> httpx.AsyncClient:
         cookies = parse_cookie_header(self.settings.cookie_header)
         jar = httpx.Cookies()
-        # Cookie header strings lose domain metadata. Set credentials for both
-        # supported hosts; only HTTPS requests to these hosts receive them.
         for name, value in cookies.items():
-            jar.set(name, value, domain=".e-hentai.org", path="/")
+            if name != "igneous":
+                jar.set(name, value, domain=".e-hentai.org", path="/")
             jar.set(name, value, domain=".exhentai.org", path="/")
         return httpx.AsyncClient(
             cookies=jar,
-            follow_redirects=True,
+            follow_redirects=False,
             timeout=httpx.Timeout(connect=20, read=90, write=30, pool=30),
             headers={"User-Agent": "Mozilla/5.0 (compatible; PersonalArchiveBot/1.0)"},
+            transport=self.transport,
         )
 
-    async def download(self, raw_url: str, progress) -> Path:
+    async def download(self, raw_url: str, progress: ProgressCallback) -> Path:
         if not self.settings.cookie_header:
-            raise RuntimeError("EH_COOKIE is not configured. Add a logged-in browser Cookie header to .env.")
+            raise RuntimeError(
+                "EH_COOKIE is not configured. Add a logged-in browser Cookie header to .env."
+            )
         host, gid, gallery_token = parse_gallery_url(raw_url)
         gallery_url = f"https://{host}/g/{gid}/{gallery_token}/"
         archiver_url = f"https://{host}/archiver.php?gid={gid}&token={gallery_token}"
         self.settings.download_dir.mkdir(parents=True, exist_ok=True)
 
         async with self._client() as client:
-            page = await self._request(client, "GET", archiver_url, headers={"Referer": gallery_url})
-            await page.aread()  # archive page is small HTML; binary replies stay streamed below
-            self._raise_for_site_error(page)
-            response = await self._submit_archive_request(client, page, archiver_url, gallery_url)
+            page = await self._request(
+                client, "GET", archiver_url, headers={"Referer": gallery_url}
+            )
+            page_html = await self._read_html(page)
+            self._raise_for_site_error(page, page_html)
+            response = await self._submit_archive_request(
+                client, page_html, archiver_url, gallery_url
+            )
             await page.aclose()
             deadline = time.monotonic() + self.settings.wait_seconds
             announced_wait = False
@@ -172,184 +375,589 @@ class ArchiveClient:
                 if is_archive_response(response):
                     return await self._save_response(response, gid, progress)
 
-                await response.aread()
-                self._raise_for_site_error(response)
-                link = archive_link_from_html(response.text, str(response.url))
+                response_html = await self._read_html(response)
+                self._raise_for_site_error(response, response_html)
+                link = archive_link_from_html(
+                    response_html,
+                    str(response.url),
+                    self.settings.archive_download_hosts,
+                )
                 if link:
                     await response.aclose()
-                    response = await self._request(client, "GET", link, headers={"Referer": gallery_url})
+                    response = await self._request(
+                        client,
+                        "GET",
+                        link,
+                        headers={"Referer": f"https://{host}/"},
+                    )
                     continue
 
                 if time.monotonic() >= deadline:
-                    raise RuntimeError("The archive was not ready before the configured wait limit.")
+                    await response.aclose()
+                    raise RuntimeError(
+                        "The archive was not ready before the configured wait limit."
+                    )
                 if not announced_wait:
-                    await progress("The site is preparing the archive; I’ll keep checking.")
+                    await progress(
+                        "The site is preparing the archive; I’ll keep checking."
+                    )
                     announced_wait = True
-                await asyncio.sleep(15)
-                # The archive page exposes the completed link when its queue is done.
                 await response.aclose()
-                response = await self._request(client, "GET", archiver_url, headers={"Referer": gallery_url})
+                await asyncio.sleep(15)
+                response = await self._request(
+                    client, "GET", archiver_url, headers={"Referer": gallery_url}
+                )
+
+    async def _request(
+        self, client: httpx.AsyncClient, method: str, url: str, **kwargs
+    ) -> httpx.Response:
+        """Send a streamed request with safe redirects and bounded GET retries."""
+        current_method = method.upper()
+        current_url = validate_outbound_url(url, self.settings.archive_download_hosts)
+        current_kwargs = dict(kwargs)
+
+        for _redirect in range(6):
+            response = await self._send_with_retries(
+                client, current_method, current_url, current_kwargs
+            )
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                return response
+            location = response.headers.get("location")
+            if not location:
+                return response
+            next_url = validate_outbound_url(
+                urljoin(str(response.url), location),
+                self.settings.archive_download_hosts,
+            )
+            await response.aclose()
+            if response.status_code == 303 or (
+                response.status_code in {301, 302}
+                and current_method not in {"GET", "HEAD"}
+            ):
+                current_method = "GET"
+                current_kwargs = {
+                    key: value
+                    for key, value in current_kwargs.items()
+                    if key == "headers"
+                }
+            current_url = next_url
+        raise RuntimeError("The site returned too many redirects.")
+
+    async def _send_with_retries(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        request_kwargs: dict,
+    ) -> httpx.Response:
+        attempts = 3 if method in {"GET", "HEAD"} else 1
+        for attempt in range(attempts):
+            try:
+                request = client.build_request(method, url, **request_kwargs)
+                response = await client.send(request, stream=True)
+            except httpx.TransportError:
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(2**attempt)
+                continue
+
+            if (
+                response.status_code not in RETRYABLE_STATUS_CODES
+                or attempt + 1 >= attempts
+            ):
+                return response
+            delay = self._retry_delay(response, attempt)
+            await response.aclose()
+            await asyncio.sleep(delay)
+        raise AssertionError("retry loop exited unexpectedly")
 
     @staticmethod
-    async def _request(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
-        """Keep possible archives streamed instead of buffering them in RAM."""
-        request = client.build_request(method, url, **kwargs)
-        return await client.send(request, stream=True)
+    def _retry_delay(response: httpx.Response, attempt: int) -> float:
+        retry_after = response.headers.get("retry-after", "")
+        try:
+            return min(max(float(retry_after), 0.0), 30.0)
+        except ValueError:
+            return float(2**attempt)
+
+    @staticmethod
+    async def _read_html(response: httpx.Response) -> str:
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_HTML_BYTES:
+                    await response.aclose()
+                    raise RuntimeError(
+                        "The site returned an unexpectedly large HTML response."
+                    )
+            except ValueError:
+                LOG.warning(
+                    "Ignoring malformed Content-Length header: %r", content_length
+                )
+
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > MAX_HTML_BYTES:
+                await response.aclose()
+                raise RuntimeError(
+                    "The site returned an unexpectedly large HTML response."
+                )
+        encoding = response.encoding or "utf-8"
+        return bytes(body).decode(encoding, errors="replace")
 
     async def _submit_archive_request(
-        self, client: httpx.AsyncClient, page: httpx.Response, archiver_url: str, gallery_url: str
+        self,
+        client: httpx.AsyncClient,
+        page_html: str,
+        archiver_url: str,
+        gallery_url: str,
     ) -> httpx.Response:
-        soup = BeautifulSoup(page.text, "html.parser")
+        soup = BeautifulSoup(page_html, "html.parser")
         form = soup.find("form")
         if not form:
-            raise RuntimeError("Could not find the archive form. Check that the account is eligible for archive downloads.")
+            raise RuntimeError(
+                "Could not find the archive form. Check that the account is eligible for archive downloads."
+            )
         data = {
-            input_tag.get("name"): input_tag.get("value", "")
+            str(input_tag.get("name")): input_tag.get("value", "")
             for input_tag in form.select("input[name]")
             if input_tag.get("type", "").lower() not in {"submit", "button"}
         }
         data["dltype"] = self.settings.archive_type
-        submit = form.select_one('input[type="submit"][name], button[type="submit"][name]')
+        submit = form.select_one(
+            'input[type="submit"][name], button[type="submit"][name]'
+        )
         if submit and submit.get("name"):
-            # The server uses this field to distinguish a confirmed archive
-            # request from merely opening the options form.
-            data[submit["name"]] = submit.get("value", "Download")
-        action = urljoin(archiver_url, form.get("action") or archiver_url)
-        return await self._request(client, "POST", action, data=data, headers={"Referer": gallery_url})
+            data[str(submit["name"])] = submit.get("value", "Download")
+        action = validate_outbound_url(
+            urljoin(archiver_url, form.get("action") or archiver_url),
+            SUPPORTED_GALLERY_HOSTS,
+        )
+        return await self._request(
+            client, "POST", action, data=data, headers={"Referer": gallery_url}
+        )
 
-    def _raise_for_site_error(self, response: httpx.Response) -> None:
+    @staticmethod
+    def _raise_for_site_error(response: httpx.Response, response_html: str) -> None:
         response.raise_for_status()
-        if is_archive_response(response):
-            return
-        text = response.text.lower()
+        text = response_html.lower()
         if any(marker in text for marker in AUTH_FAILURE_MARKERS):
-            raise RuntimeError("The configured session is not logged in or has expired. Refresh EH_COOKIE.")
-        if "sad panda" in text or "exhentai.org" in str(response.url) and "restricted" in text:
-            raise RuntimeError("This account cannot access ExHentai from the current network/session.")
+            raise RuntimeError(
+                "The configured session is not logged in or has expired. Refresh EH_COOKIE."
+            )
+        if "sad panda" in text or (
+            "exhentai.org" in str(response.url) and "restricted" in text
+        ):
+            raise RuntimeError(
+                "This account cannot access ExHentai from the current network/session."
+            )
         if "insufficient funds" in text or "insufficient gp" in text:
-            raise RuntimeError("The account does not have enough archive points for this download.")
+            raise RuntimeError(
+                "The account does not have enough archive points for this download."
+            )
 
-    async def _save_response(self, response: httpx.Response, gid: str, progress) -> Path:
-        length_header = response.headers.get("content-length")
-        if length_header:
-            try:
-                if int(length_header) > self.settings.max_archive_bytes:
-                    raise RuntimeError("The archive exceeds MAX_ARCHIVE_GIB and was not saved.")
-            except ValueError:
-                LOG.warning("Ignoring malformed Content-Length header: %r", length_header)
-        filename = filename_from_response(response, f"ehentai-{gid}.zip")
+    def _storage_budget(self) -> int:
+        existing_bytes = sum(
+            entry.stat().st_size
+            for entry in self.settings.download_dir.iterdir()
+            if entry.is_file() and not entry.name.endswith(".part")
+        )
+        quota_remaining = self.settings.max_total_bytes - existing_bytes
+        disk_remaining = (
+            shutil.disk_usage(self.settings.download_dir).free
+            - self.settings.min_free_bytes
+        )
+        budget = min(self.settings.max_archive_bytes, quota_remaining, disk_remaining)
+        if budget <= 0:
+            raise RuntimeError(
+                "Download storage quota or minimum free-disk reserve has been reached."
+            )
+        return budget
+
+    def _unique_destination(self, filename: str, gid: str) -> Path:
         destination = self.settings.download_dir / filename
-        # Never silently overwrite a previously downloaded archive.
-        if destination.exists():
-            destination = self.settings.download_dir / f"{destination.stem}-{int(time.time())}{destination.suffix}"
-        written = 0
-        await progress(f"Downloading `{destination.name}`…")
-        with destination.open("xb") as file_handle:
-            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                written += len(chunk)
-                if written > self.settings.max_archive_bytes:
-                    file_handle.close()
-                    destination.unlink(missing_ok=True)
-                    raise RuntimeError("The archive exceeded MAX_ARCHIVE_GIB; the partial file was removed.")
-                file_handle.write(chunk)
-        return destination
+        if not destination.exists():
+            return destination
+        return (
+            self.settings.download_dir
+            / f"{destination.stem}-{gid}-{uuid4().hex[:8]}{destination.suffix}"
+        )
+
+    def _commit_temporary(self, temporary: Path, filename: str, gid: str) -> Path:
+        """Publish a complete file atomically without overwriting any path."""
+        while True:
+            destination = self._unique_destination(filename, gid)
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                continue
+            temporary.unlink()
+            return destination
+
+    async def _save_response(
+        self, response: httpx.Response, gid: str, progress: ProgressCallback
+    ) -> Path:
+        temporary: Path | None = None
+        try:
+            budget = self._storage_budget()
+            length_header = response.headers.get("content-length")
+            total_bytes: int | None = None
+            if length_header:
+                try:
+                    parsed_length = int(length_header)
+                    if parsed_length > budget:
+                        raise RuntimeError(
+                            "The archive exceeds the configured storage limits and was not saved."
+                        )
+                    if parsed_length > 0:
+                        total_bytes = parsed_length
+                except ValueError:
+                    LOG.warning(
+                        "Ignoring malformed Content-Length header: %r", length_header
+                    )
+
+            filename = filename_from_response(response, f"ehentai-{gid}.zip")
+            temporary = self.settings.download_dir / f".{uuid4().hex}.part"
+            written = 0
+            last_reported_bytes = 0
+            last_reported_percentage = 0
+            last_progress_at = time.monotonic()
+            await progress(download_progress_message(filename, 0, total_bytes))
+            with temporary.open("xb") as file_handle:
+                async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                    written += len(chunk)
+                    if written > budget:
+                        raise RuntimeError(
+                            "The archive exceeded the configured storage limits; the partial file was removed."
+                        )
+                    file_handle.write(chunk)
+                    current_percentage = (
+                        min(100, int(written * 100 / total_bytes))
+                        if total_bytes is not None
+                        else None
+                    )
+                    now = time.monotonic()
+                    percentage_advanced = (
+                        current_percentage is not None
+                        and current_percentage >= last_reported_percentage + 5
+                    )
+                    if (
+                        percentage_advanced
+                        or now - last_progress_at >= PROGRESS_UPDATE_SECONDS
+                    ):
+                        await progress(
+                            download_progress_message(filename, written, total_bytes)
+                        )
+                        last_reported_bytes = written
+                        last_reported_percentage = current_percentage or 0
+                        last_progress_at = now
+                file_handle.flush()
+                os.fsync(file_handle.fileno())
+
+            if written != last_reported_bytes:
+                await progress(
+                    download_progress_message(filename, written, total_bytes)
+                )
+            await progress(
+                f"🔎 Download received: {filename}\n"
+                f"{format_bytes(written)} — validating archive…"
+            )
+
+            detected_suffix = archive_format(temporary)
+            if detected_suffix is None:
+                raise RuntimeError(
+                    "The downloaded response was not a recognized ZIP, RAR, or 7z archive."
+                )
+            declared_suffix = Path(filename).suffix.lower()
+            if declared_suffix in {".zip", ".rar", ".7z"}:
+                if declared_suffix != detected_suffix:
+                    filename = f"{Path(filename).stem}{detected_suffix}"
+            else:
+                filename = f"{filename}{detected_suffix}"
+            return self._commit_temporary(temporary, filename, gid)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            await response.aclose()
 
 
 class BotService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, client: ArchiveClient | None = None) -> None:
         self.settings = settings
-        self.client = ArchiveClient(settings)
-        self.logged_in_users: set[int] = set()
-        self.jobs = asyncio.Semaphore(1)  # avoids concurrent archive quota/queue surprises
+        self.client = client or ArchiveClient(settings)
+        self.queue: asyncio.Queue[ArchiveJob] = asyncio.Queue(
+            maxsize=settings.queue_size
+        )
+        self.active_job: ArchiveJob | None = None
+        self.worker_task: asyncio.Task[None] | None = None
+        self.pending_downloads: dict[str, PendingDownload] = {}
 
-    def allowed(self, user_id: int | None) -> bool:
-        return user_id is not None and (not self.settings.allowed_user_ids or user_id in self.settings.allowed_user_ids)
+    def authorized(self, update: Update) -> bool:
+        user = update.effective_user
+        chat = update.effective_chat
+        return (
+            user is not None
+            and user.id in self.settings.allowed_user_ids
+            and chat is not None
+            and chat.type == ChatType.PRIVATE
+        )
+
+    async def post_init(self, application: Application) -> None:
+        self.worker_task = asyncio.create_task(self._worker(), name="archive-worker")
+
+    async def post_shutdown(self, application: Application) -> None:
+        if self.worker_task is None:
+            return
+        self.worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await self.worker_task
+
+    async def _safe_edit(self, notice: Message, message: str) -> None:
+        for attempt in range(3):
+            try:
+                await notice.edit_text(message, reply_markup=None)
+                return
+            except RetryAfter as exc:
+                retry_after = exc.retry_after
+                delay = (
+                    retry_after.total_seconds()
+                    if hasattr(retry_after, "total_seconds")
+                    else float(retry_after)
+                )
+                await asyncio.sleep(min(max(delay, 0.0), 30.0))
+            except NetworkError:
+                if attempt == 2:
+                    LOG.exception("Could not update Telegram job notice")
+                    return
+                await asyncio.sleep(2**attempt)
+            except TelegramError:
+                LOG.exception("Could not update Telegram job notice")
+                return
+        LOG.warning("Could not update Telegram job notice after retries")
+
+    @staticmethod
+    async def _safe_answer(
+        query: CallbackQuery, message: str | None = None, *, show_alert: bool = False
+    ) -> None:
+        try:
+            await query.answer(message, show_alert=show_alert)
+        except TelegramError:
+            LOG.warning("Could not answer Telegram callback query", exc_info=True)
+
+    def _prune_pending_downloads(self) -> None:
+        cutoff = time.monotonic() - CONFIRMATION_TTL_SECONDS
+        expired = [
+            request_id
+            for request_id, pending in self.pending_downloads.items()
+            if pending.created_at < cutoff
+        ]
+        for request_id in expired:
+            self.pending_downloads.pop(request_id, None)
+
+    async def _worker(self) -> None:
+        while True:
+            job = await self.queue.get()
+            self.active_job = job
+
+            async def progress(message: str, notice: Message = job.notice) -> None:
+                await self._safe_edit(notice, message)
+
+            try:
+                archive = await self.client.download(job.url, progress)
+                await self._safe_edit(
+                    job.notice,
+                    f"✅ Download completed successfully\n"
+                    f"File: {archive.name}\n"
+                    f"Size: {format_bytes(archive.stat().st_size)}\n"
+                    f"Saved to: {archive.parent}",
+                )
+            except asyncio.CancelledError:
+                await self._safe_edit(
+                    job.notice, "Download interrupted because the bot is stopping."
+                )
+                raise
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                LOG.warning("Download failed for user %s: %s", job.user_id, exc)
+                await self._safe_edit(job.notice, f"❌ Download failed\n{exc}")
+            except Exception:
+                LOG.exception("Unexpected download failure for user %s", job.user_id)
+                await self._safe_edit(
+                    job.notice,
+                    "❌ Download failed unexpectedly\nCheck the bot logs for details.",
+                )
+            finally:
+                self.active_job = None
+                self.queue.task_done()
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.allowed(update.effective_user.id if update.effective_user else None):
-            await update.effective_message.reply_text("This bot is private.")
+        if not self.authorized(update):
             return
         await update.effective_message.reply_text(
-            "Send /login <bot password>, then forward or paste an E-Hentai or ExHentai gallery URL.\n"
-            "Use /status to check configuration; /whoami shows your Telegram ID."
+            "Send or forward an E-Hentai or ExHentai gallery URL.\n"
+            "I’ll ask for confirmation before queueing it.\n"
+            "Use /status to check configuration and queue state."
         )
 
     async def whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_message.reply_text(f"Your Telegram user ID: {update.effective_user.id}")
-
-    async def login(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.allowed(update.effective_user.id if update.effective_user else None):
-            await update.effective_message.reply_text("This bot is private.")
+        if not self.authorized(update):
             return
-        supplied = " ".join(context.args)
-        if not self.settings.access_password:
-            await update.effective_message.reply_text("BOT_ACCESS_PASSWORD is not configured on the server.")
-        elif secrets.compare_digest(supplied, self.settings.access_password):
-            self.logged_in_users.add(update.effective_user.id)
-            await update.effective_message.reply_text("Logged in for this bot session. Send a gallery URL when ready.")
-        else:
-            await update.effective_message.reply_text("Login failed.")
-
-    async def logout(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        self.logged_in_users.discard(update.effective_user.id)
-        await update.effective_message.reply_text("Logged out.")
-
-    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not self.allowed(update.effective_user.id if update.effective_user else None):
-            await update.effective_message.reply_text("This bot is private.")
-            return
-        cookie_state = "configured" if self.settings.cookie_header else "missing"
         await update.effective_message.reply_text(
-            f"Site session: {cookie_state}\nDestination: {self.settings.download_dir}\nFormat: {self.settings.archive_type}"
+            f"Your Telegram user ID: {update.effective_user.id}"
         )
 
-    async def gallery_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        user_id = update.effective_user.id if update.effective_user else None
-        if not self.allowed(user_id):
-            await update.effective_message.reply_text("This bot is private.")
+    async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self.authorized(update):
             return
-        if user_id not in self.logged_in_users:
-            await update.effective_message.reply_text("Use /login first.")
-            return
-        text = update.effective_message.text or update.effective_message.caption or ""
-        urls = re.findall(r"https?://[^\s]+", text)
-        if not urls:
-            await update.effective_message.reply_text("I couldn’t find a URL in that message.")
-            return
-        try:
-            parse_gallery_url(urls[0])
-        except ValueError as exc:
-            await update.effective_message.reply_text(str(exc))
-            return
-        await update.effective_message.reply_chat_action(ChatAction.TYPING)
-        notice = await update.effective_message.reply_text("Queued. Requesting the site archive…")
+        cookie_state = "configured" if self.settings.cookie_header else "missing"
+        active_state = "active" if self.active_job else "idle"
+        await update.effective_message.reply_text(
+            f"Site session: {cookie_state}\n"
+            f"Destination: {self.settings.download_dir}\n"
+            f"Format: {self.settings.archive_type}\n"
+            f"Worker: {active_state}\n"
+            f"Queued: {self.queue.qsize()}"
+        )
 
-        async def progress(message: str) -> None:
-            await notice.edit_text(message)
+    async def gallery_message(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not self.authorized(update):
+            return
+        message = update.effective_message
+        text = message.text or message.caption or ""
+        gallery_url = extract_gallery_url(text)
+        if gallery_url is None:
+            await message.reply_text(
+                "I couldn’t find a valid E-Hentai or ExHentai gallery URL in that message."
+            )
+            return
 
+        await message.reply_chat_action(ChatAction.TYPING)
+        self._prune_pending_downloads()
+        if len(self.pending_downloads) >= self.settings.queue_size:
+            await message.reply_text(
+                "There are too many requests awaiting confirmation. Respond to an existing prompt first."
+            )
+            return
+
+        request_id = uuid4().hex
+        archive_label = (
+            "original files"
+            if self.settings.archive_type == "org"
+            else "resampled files"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ Yes, download",
+                        callback_data=f"archive:confirm:{request_id}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ No, cancel", callback_data=f"archive:cancel:{request_id}"
+                    ),
+                ]
+            ]
+        )
+        await message.reply_text(
+            f"Download this gallery?\n\n{gallery_url}\n\nArchive: {archive_label}",
+            reply_markup=keyboard,
+        )
+        self.pending_downloads[request_id] = PendingDownload(
+            url=gallery_url,
+            user_id=update.effective_user.id,
+            created_at=time.monotonic(),
+        )
+
+    async def confirm_download(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        if not self.authorized(update) or update.callback_query is None:
+            return
+        query = update.callback_query
+        data = query.data or ""
         try:
-            async with self.jobs:
-                archive = await self.client.download(urls[0], progress)
-            await notice.edit_text(f"Finished: `{archive.name}`\nSaved to `{archive.parent}`", parse_mode="Markdown")
-        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-            LOG.warning("Download failed: %s", exc)
-            await notice.edit_text(f"Download failed: {exc}")
-        except Exception:
-            LOG.exception("Unexpected download failure")
-            await notice.edit_text("Download failed unexpectedly; check the bot logs.")
+            _prefix, action, request_id = data.split(":", 2)
+        except ValueError:
+            await self._safe_answer(query, "Invalid download request.", show_alert=True)
+            return
+        if action not in {"confirm", "cancel"}:
+            await self._safe_answer(query, "Invalid download request.", show_alert=True)
+            return
+
+        self._prune_pending_downloads()
+        pending = self.pending_downloads.get(request_id)
+        if pending is None:
+            await self._safe_answer(
+                query, "This confirmation has expired.", show_alert=True
+            )
+            if query.message is not None:
+                await self._safe_edit(
+                    query.message, "This download confirmation has expired."
+                )
+            return
+        if pending.user_id != update.effective_user.id:
+            await self._safe_answer(
+                query, "This confirmation belongs to another user.", show_alert=True
+            )
+            return
+
+        self.pending_downloads.pop(request_id, None)
+        await self._safe_answer(query)
+        if query.message is None:
+            return
+        if action == "cancel":
+            await self._safe_edit(query.message, "Download cancelled.")
+            return
+
+        queue_position = self.queue.qsize() + (1 if self.active_job else 0) + 1
+        try:
+            self.queue.put_nowait(
+                ArchiveJob(
+                    url=pending.url,
+                    notice=query.message,
+                    user_id=update.effective_user.id,
+                )
+            )
+        except asyncio.QueueFull:
+            await self._safe_edit(
+                query.message, "The download queue is full; try again later."
+            )
+            return
+        await self._safe_edit(
+            query.message, f"⏳ Confirmed and queued at position {queue_position}."
+        )
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     settings = Settings.from_env()
     service = BotService(settings)
-    app = Application.builder().token(settings.token).build()
+    app = (
+        Application.builder()
+        .token(settings.token)
+        .concurrent_updates(8)
+        .post_init(service.post_init)
+        .post_shutdown(service.post_shutdown)
+        .build()
+    )
     app.add_handler(CommandHandler("start", service.start))
     app.add_handler(CommandHandler("whoami", service.whoami))
-    app.add_handler(CommandHandler("login", service.login))
-    app.add_handler(CommandHandler("logout", service.logout))
     app.add_handler(CommandHandler("status", service.status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, service.gallery_message))
+    app.add_handler(
+        CallbackQueryHandler(
+            service.confirm_download,
+            pattern=r"^archive:(?:confirm|cancel):[0-9a-f]{32}$",
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, service.gallery_message
+        )
+    )
     LOG.info("Bot starting; destination is %s", settings.download_dir)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

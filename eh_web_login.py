@@ -8,6 +8,7 @@ from the pages you visit and writes EH_COOKIE when the window closes.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 from collections.abc import Iterable
@@ -31,7 +32,9 @@ def parse_cookie_string(cookie_string: str) -> dict[str, str]:
 
 
 def cookie_header(cookies: dict[str, str]) -> str:
-    return "; ".join(f"{name}={cookies[name]}" for name in COOKIE_NAMES if cookies.get(name))
+    return "; ".join(
+        f"{name}={cookies[name]}" for name in COOKIE_NAMES if cookies.get(name)
+    )
 
 
 def is_ready(cookies: dict[str, str], require_exhentai: bool) -> bool:
@@ -62,14 +65,32 @@ class CookieCollector:
         with self._save_lock:
             if self.saved:
                 return
-            set_key(self.output_path, "EH_COOKIE", cookie_header(self.cookies), quote_mode="always")
+            set_key(
+                self.output_path,
+                "EH_COOKIE",
+                cookie_header(self.cookies),
+                quote_mode="always",
+            )
+            # set_key may replace the file, so enforce the final permissions
+            # after it completes instead of relying on the caller's umask.
+            os.chmod(self.output_path, 0o600)
             self.saved = True
-            print(f"EH_COOKIE saved to {self.output_path}; you can close the window normally.")
+            print(
+                f"EH_COOKIE saved to {self.output_path}; you can close the window normally."
+            )
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Open a WebView and export an EH_COOKIE after you log in manually.")
-    parser.add_argument("--write-env", type=Path, default=Path(".env"), metavar="PATH", help="target .env file (default: .env)")
+    parser = argparse.ArgumentParser(
+        description="Open a WebView and export an EH_COOKIE after you log in manually."
+    )
+    parser.add_argument(
+        "--write-env",
+        type=Path,
+        default=Path(".env"),
+        metavar="PATH",
+        help="target .env file (default: .env)",
+    )
     parser.add_argument(
         "--allow-eh-only",
         action="store_true",
@@ -83,11 +104,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     try:
         import webview
     except ImportError:
-        print("Missing GUI dependency. Install it with: uv sync --extra login", file=sys.stderr)
+        print(
+            "Missing GUI dependency. Install it with: uv sync --extra login",
+            file=sys.stderr,
+        )
         return 2
 
     require_exhentai = not args.allow_eh_only
-    collector = CookieCollector(output_path=args.write_env, require_exhentai=require_exhentai)
+    collector = CookieCollector(
+        output_path=args.write_env, require_exhentai=require_exhentai
+    )
     window = webview.create_window(
         "E-Hentai session setup",
         EH_HOME_URL,
@@ -125,7 +151,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     window.events.loaded += inject_cookie_capture
     print("Complete the site verification and sign in in the displayed window.")
-    print(f"The window starts on {EH_HOME_URL} and automatically opens {EX_HOME_URL} after E-Hentai sign-in.")
+    print(
+        f"The window starts on {EH_HOME_URL} and automatically opens {EX_HOME_URL} after E-Hentai sign-in."
+    )
     print("When the terminal confirms EH_COOKIE was saved, close the window normally.")
     webview.start()
 
@@ -135,7 +163,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             for name in COOKIE_NAMES
             if name not in collector.cookies and (require_exhentai or name != "igneous")
         ]
-        print(f"No configuration was written. Missing required cookie(s): {', '.join(missing)}.", file=sys.stderr)
+        print(
+            f"No configuration was written. Missing required cookie(s): {', '.join(missing)}.",
+            file=sys.stderr,
+        )
         return 1
 
     return 0
