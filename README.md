@@ -98,9 +98,10 @@ validates the result, and atomically writes it to `DOWNLOAD_DIR`. Change
 `ARCHIVE_TYPE=res` to request a resampled archive. Unanswered confirmation
 prompts expire after ten minutes or when the bot restarts.
 
-If the site serves archives from a separate domain, add that exact domain to
-`ARCHIVE_DOWNLOAD_HOSTS`. Redirects and download links outside the trusted host
-list are rejected.
+The gallery domains and the official `hath.network` archive CDN, including
+their subdomains, are trusted by default. If the site begins serving archives
+from another domain, add that exact domain to `ARCHIVE_DOWNLOAD_HOSTS`.
+Redirects and download links outside the trusted host list are rejected.
 
 ## Operations and security
 

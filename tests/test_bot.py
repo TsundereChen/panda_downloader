@@ -186,7 +186,8 @@ def test_function_call_logging_records_names_without_values(caplog, monkeypatch)
     assert "1024" not in caplog.text
 
 
-def test_completed_link_is_resolved_and_external_link_is_rejected():
+def test_completed_link_is_resolved_and_external_link_is_rejected(caplog):
+    caplog.set_level(logging.INFO, logger="bot")
     assert (
         archive_link_from_html(
             '<a href="/archive/file.zip">Download archive</a>', "https://e-hentai.org/a"
@@ -195,11 +196,15 @@ def test_completed_link_is_resolved_and_external_link_is_rejected():
     )
     assert (
         archive_link_from_html(
-            '<a href="https://attacker.example/file.zip">Download archive</a>',
+            '<div id="continue"><a href="https://attacker.example/file.zip">'
+            "Download archive</a></div>",
             "https://e-hentai.org/a",
         )
         is None
     )
+    assert "link_candidate_rejected" in caplog.text
+    assert "host=attacker.example" in caplog.text
+    assert "file.zip" in caplog.text
 
 
 def test_official_download_link_replaces_autostart_with_start():
@@ -208,6 +213,15 @@ def test_official_download_link_replaces_autostart_with_start():
         "Start download</a></p></div>",
         "https://e-hentai.org/download-page",
     ) == "https://e-hentai.org/archive/12?token=abc&start=1"
+
+
+def test_official_hath_archive_subdomain_is_trusted_by_default():
+    assert archive_link_from_html(
+        '<div id="db"><p><a '
+        'href="https://archive-node.hath.network/archive/token?autostart=1">'
+        "Start download</a></p></div>",
+        "https://e-hentai.org/archiver.php",
+    ) == "https://archive-node.hath.network/archive/token?start=1"
 
 
 def test_filename_content_disposition():

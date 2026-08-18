@@ -48,6 +48,9 @@ from telegram.ext import (
 LOG = logging.getLogger(__name__)
 APP_SOURCE_FILE: Final = str(Path(__file__).resolve())
 SUPPORTED_GALLERY_HOSTS: Final = frozenset({"e-hentai.org", "exhentai.org"})
+DEFAULT_ARCHIVE_DOWNLOAD_HOSTS: Final = frozenset(
+    {*SUPPORTED_GALLERY_HOSTS, "hath.network"}
+)
 KNOWN_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash", "igneous"})
 REQUIRED_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash"})
 GALLERY_PATH_RE: Final = re.compile(r"^/g/(?P<gid>\d+)/(?P<token>[0-9a-fA-F]+)/?$")
@@ -106,7 +109,17 @@ def safe_url_for_log(url: str) -> str:
     """Return a URL location without credentials, query parameters, or fragments."""
     parsed = urlparse(url)
     host = (parsed.hostname or "unknown").lower().rstrip(".")
-    return f"{parsed.scheme.lower() or 'unknown'}://{host}{parsed.path or '/'}"
+    return f"{parsed.scheme.lower() or 'unknown'}://{host}{safe_path_for_log(parsed.path)}"
+
+
+def safe_path_for_log(path: str) -> str:
+    """Keep a route name while hiding deeper path segments that may be tokens."""
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments:
+        return "/"
+    if len(segments) == 1:
+        return f"/{segments[0]}"
+    return f"/{segments[0]}/<redacted>"
 
 
 def archive_html_state(html: str) -> str:
@@ -185,7 +198,7 @@ def _positive_int_env(name: str, default: str) -> int:
 
 
 def _parse_allowed_hosts(raw_hosts: str) -> frozenset[str]:
-    hosts = set(SUPPORTED_GALLERY_HOSTS)
+    hosts = set(DEFAULT_ARCHIVE_DOWNLOAD_HOSTS)
     for item in raw_hosts.split(","):
         host = item.strip().lower().rstrip(".")
         if not host:
@@ -433,7 +446,9 @@ def validate_outbound_url(url: str, allowed_hosts: frozenset[str]) -> str:
 
 
 def archive_link_from_html(
-    html: str, page_url: str, allowed_hosts: frozenset[str] = SUPPORTED_GALLERY_HOSTS
+    html: str,
+    page_url: str,
+    allowed_hosts: frozenset[str] = DEFAULT_ARCHIVE_DOWNLOAD_HOSTS,
 ) -> str | None:
     """Find the next official archive link and normalize the final download URL."""
     soup = BeautifulSoup(html, "html.parser")
@@ -446,11 +461,27 @@ def archive_link_from_html(
     ):
         anchor = soup.select_one(selector)
         if anchor is None:
+            LOG.info("archive step=link_selector_empty selector=%s", selector)
             continue
         href = urljoin(page_url, anchor["href"])
+        LOG.info(
+            "archive step=link_candidate selector=%s location=%s",
+            selector,
+            safe_url_for_log(href),
+        )
         try:
             href = validate_outbound_url(href, allowed_hosts)
-        except RuntimeError:
+        except RuntimeError as exc:
+            parsed = urlparse(href)
+            LOG.warning(
+                "archive step=link_candidate_rejected selector=%s scheme=%s host=%s "
+                "path=%s reason=%s",
+                selector,
+                parsed.scheme.lower() or "none",
+                (parsed.hostname or "none").lower().rstrip("."),
+                safe_path_for_log(parsed.path),
+                exc,
+            )
             continue
         if is_download_link:
             parsed = urlparse(href)
@@ -458,6 +489,11 @@ def archive_link_from_html(
             query.pop("autostart", None)
             query.setdefault("start", "1")
             href = urlunparse(parsed._replace(query=urlencode(query)))
+        LOG.info(
+            "archive step=link_candidate_accepted selector=%s location=%s",
+            selector,
+            safe_url_for_log(href),
+        )
         return href
 
     for anchor in soup.select("a[href]"):
