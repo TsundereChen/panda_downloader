@@ -45,6 +45,7 @@ from telegram.ext import (
 LOG = logging.getLogger(__name__)
 SUPPORTED_GALLERY_HOSTS: Final = frozenset({"e-hentai.org", "exhentai.org"})
 KNOWN_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash", "igneous"})
+REQUIRED_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash"})
 GALLERY_PATH_RE: Final = re.compile(r"^/g/(?P<gid>\d+)/(?P<token>[0-9a-fA-F]+)/?$")
 SAFE_FILENAME_RE: Final = re.compile(r"[^\w.()\[\] -]+", re.UNICODE)
 HOSTNAME_RE: Final = re.compile(
@@ -151,10 +152,12 @@ class Settings:
                 "MAX_TOTAL_DOWNLOAD_GIB must be at least MAX_ARCHIVE_GIB"
             )
 
+        cookie_header = validate_cookie_header(os.getenv("EH_COOKIE", ""))
+
         return cls(
             token=token,
             allowed_user_ids=allowed,
-            cookie_header=os.getenv("EH_COOKIE", "").strip(),
+            cookie_header=cookie_header,
             download_dir=Path(os.getenv("DOWNLOAD_DIR", "./downloads"))
             .expanduser()
             .resolve(),
@@ -242,13 +245,39 @@ def extract_gallery_url(text: str) -> str | None:
     return None
 
 
+def normalize_cookie_header(header: str) -> str:
+    """Normalize dotenv-style quoting that Podman env files preserve literally."""
+    normalized = header.strip()
+    if not normalized:
+        return normalized
+    starts_quoted = normalized[0] in {"'", '"'}
+    ends_quoted = normalized[-1] in {"'", '"'}
+    if starts_quoted or ends_quoted:
+        if not (starts_quoted and normalized[-1] == normalized[0]):
+            raise RuntimeError("EH_COOKIE has unmatched surrounding quotes")
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
 def parse_cookie_header(header: str) -> dict[str, str]:
     cookies: dict[str, str] = {}
-    for part in header.split(";"):
+    for part in normalize_cookie_header(header).split(";"):
         name, separator, value = part.strip().partition("=")
         if separator and name in KNOWN_COOKIE_NAMES and value:
             cookies[name] = value
     return cookies
+
+
+def validate_cookie_header(header: str, host: str | None = None) -> str:
+    normalized = normalize_cookie_header(header)
+    cookies = parse_cookie_header(normalized)
+    missing = REQUIRED_COOKIE_NAMES - cookies.keys()
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise RuntimeError(f"EH_COOKIE is missing required cookie(s): {names}")
+    if host == "exhentai.org" and "igneous" not in cookies:
+        raise RuntimeError("EH_COOKIE must include igneous for ExHentai downloads")
+    return normalized
 
 
 def safe_filename(name: str, fallback: str) -> str:
@@ -386,11 +415,8 @@ class ArchiveClient:
         )
 
     async def download(self, raw_url: str, progress: ProgressCallback) -> Path:
-        if not self.settings.cookie_header:
-            raise RuntimeError(
-                "EH_COOKIE is not configured. Add a logged-in browser Cookie header to .env."
-            )
         host, gid, gallery_token = parse_gallery_url(raw_url)
+        validate_cookie_header(self.settings.cookie_header, host)
         gallery_url = f"https://{host}/g/{gid}/{gallery_token}/"
         archiver_url = f"https://{host}/archiver.php?gid={gid}&token={gallery_token}"
         self.settings.download_dir.mkdir(parents=True, exist_ok=True)
@@ -550,8 +576,33 @@ class ArchiveClient:
         gallery_url: str,
     ) -> httpx.Response:
         soup = BeautifulSoup(page_html, "html.parser")
-        form = soup.find("form")
+        form = None
+        action = None
+        login_form_found = False
+        for candidate in soup.find_all("form"):
+            candidate_action = urljoin(
+                archiver_url, candidate.get("action") or archiver_url
+            )
+            parsed_action = urlparse(candidate_action)
+            input_names = {
+                str(input_tag.get("name", "")).lower()
+                for input_tag in candidate.select("input[name]")
+            }
+            if (
+                "act=login" in parsed_action.query.lower()
+                or any("password" in name for name in input_names)
+            ):
+                login_form_found = True
+                continue
+            if parsed_action.path.lower().endswith("/archiver.php"):
+                form = candidate
+                action = candidate_action
+                break
         if not form:
+            if login_form_found:
+                raise RuntimeError(
+                    "The configured session is not logged in or has expired. Refresh EH_COOKIE."
+                )
             raise RuntimeError(
                 "Could not find the archive form. Check that the account is eligible for archive downloads."
             )
@@ -566,16 +617,24 @@ class ArchiveClient:
         )
         if submit and submit.get("name"):
             data[str(submit["name"])] = submit.get("value", "Download")
-        action = validate_outbound_url(
-            urljoin(archiver_url, form.get("action") or archiver_url),
-            SUPPORTED_GALLERY_HOSTS,
-        )
+        action = validate_outbound_url(action, SUPPORTED_GALLERY_HOSTS)
         return await self._request(
             client, "POST", action, data=data, headers={"Referer": gallery_url}
         )
 
     @staticmethod
     def _raise_for_site_error(response: httpx.Response, response_html: str) -> None:
+        parsed_url = urlparse(str(response.url))
+        if response.status_code in {401, 403} and (
+            "act=login" in parsed_url.query.lower()
+            or (
+                (parsed_url.hostname or "").lower() == "forums.e-hentai.org"
+                and parsed_url.path.lower().endswith("/index.php")
+            )
+        ):
+            raise RuntimeError(
+                "The configured session is not logged in or has expired. Refresh EH_COOKIE."
+            )
         response.raise_for_status()
         text = response_html.lower()
         if any(marker in text for marker in AUTH_FAILURE_MARKERS):

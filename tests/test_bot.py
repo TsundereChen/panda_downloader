@@ -20,6 +20,7 @@ from bot import (
     extract_gallery_url,
     filename_from_response,
     format_bytes,
+    normalize_cookie_header,
     parse_cookie_header,
     parse_gallery_url,
 )
@@ -93,6 +94,22 @@ def test_cookie_header_parser_keeps_only_required_site_cookies():
     ) == {"ipb_member_id": "123", "ipb_pass_hash": "two=three", "igneous": "gate"}
 
 
+def test_cookie_header_normalizes_podman_literal_quotes():
+    header = "'ipb_member_id=123; ipb_pass_hash=hash; igneous=gate'"
+
+    assert normalize_cookie_header(header) == header[1:-1]
+    assert parse_cookie_header(header) == {
+        "ipb_member_id": "123",
+        "ipb_pass_hash": "hash",
+        "igneous": "gate",
+    }
+
+
+def test_cookie_header_rejects_unmatched_quotes():
+    with pytest.raises(RuntimeError, match="unmatched"):
+        parse_cookie_header("'ipb_member_id=123; ipb_pass_hash=hash")
+
+
 def test_log_formatter_redacts_bot_token_and_cookie_values():
     formatter = SecretRedactingFormatter(
         "%(levelname)s %(message)s",
@@ -153,9 +170,35 @@ def test_settings_reject_invalid_archive_host(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
     monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("EH_COOKIE", "ipb_member_id=1; ipb_pass_hash=hash")
     monkeypatch.setenv("ARCHIVE_DOWNLOAD_HOSTS", "https://bad.example")
     with pytest.raises(RuntimeError, match="hostnames"):
         Settings.from_env()
+
+
+def test_settings_require_complete_site_cookie(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv("EH_COOKIE", "ipb_pass_hash=hash; igneous=gate")
+
+    with pytest.raises(RuntimeError, match="ipb_member_id"):
+        Settings.from_env()
+
+
+def test_settings_normalize_podman_cookie_quotes(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "token")
+    monkeypatch.setenv("ALLOWED_TELEGRAM_USER_IDS", "123")
+    monkeypatch.setenv(
+        "EH_COOKIE", "'ipb_member_id=1; ipb_pass_hash=hash; igneous=gate'"
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.cookie_header == (
+        "ipb_member_id=1; ipb_pass_hash=hash; igneous=gate"
+    )
 
 
 def test_only_approved_private_users_are_authorized(tmp_path):
@@ -325,6 +368,58 @@ def test_archive_client_complete_flow(tmp_path):
         ("POST", "/archiver.php"),
         ("GET", "/archive/file.zip"),
     ]
+
+
+def test_exhentai_download_requires_igneous_before_network_access(tmp_path):
+    client = ArchiveClient(
+        make_settings(
+            tmp_path, cookie_header="ipb_member_id=1; ipb_pass_hash=hash"
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="igneous"):
+        asyncio.run(
+            client.download("https://exhentai.org/g/12/abcdef/", AsyncMock())
+        )
+
+
+def test_login_form_is_reported_as_expired_session_without_submission(tmp_path):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append((request.method, str(request.url)))
+        return httpx.Response(
+            200,
+            text=(
+                '<form action="https://forums.e-hentai.org/index.php?act=Login&amp;CODE=01">'
+                '<input name="UserName"><input name="PassWord" type="password">'
+                "</form>"
+            ),
+        )
+
+    client = ArchiveClient(
+        make_settings(tmp_path), transport=httpx.MockTransport(handler)
+    )
+
+    with pytest.raises(RuntimeError, match="not logged in or has expired"):
+        asyncio.run(
+            client.download("https://e-hentai.org/g/12/abcdef/", AsyncMock())
+        )
+
+    assert len(calls) == 1
+    assert calls[0][0] == "GET"
+
+
+def test_login_endpoint_403_is_reported_as_expired_session(tmp_path):
+    response = httpx.Response(
+        403,
+        request=httpx.Request(
+            "POST", "https://forums.e-hentai.org/index.php?act=Login&CODE=01"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="not logged in or has expired"):
+        ArchiveClient(make_settings(tmp_path))._raise_for_site_error(response, "")
 
 
 def test_external_redirect_is_blocked(tmp_path):

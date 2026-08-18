@@ -40,7 +40,8 @@ the bot private. The service never uploads archives to Telegram.
 
    This is an interactive login, not a challenge bypass. If the WebView is
    rejected, sign in through your usual browser and paste the relevant Cookie
-   request header into `EH_COOKIE` manually. The bot only uses
+   request header into `EH_COOKIE` manually. Keep the value unquoted when the
+   file is consumed by Podman. The bot only uses
    `ipb_member_id`, `ipb_pass_hash`, and `igneous`. Cookies expire; rerun the
    helper or refresh the value when the bot reports an expired session.
 6. Start the bot:
