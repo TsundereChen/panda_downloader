@@ -170,6 +170,43 @@ class Settings:
         )
 
 
+class SecretRedactingFormatter(logging.Formatter):
+    """Remove configured credentials from fully rendered log records."""
+
+    def __init__(self, fmt: str, secrets_to_redact: tuple[str, ...]) -> None:
+        super().__init__(fmt)
+        self.secrets_to_redact = tuple(
+            sorted(
+                (secret for secret in secrets_to_redact if secret),
+                key=len,
+                reverse=True,
+            )
+        )
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        for secret in self.secrets_to_redact:
+            rendered = rendered.replace(secret, "<redacted>")
+        return rendered
+
+
+def configure_logging(settings: Settings) -> None:
+    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format=log_format)
+    cookie_values = tuple(parse_cookie_header(settings.cookie_header).values())
+    formatter = SecretRedactingFormatter(
+        log_format,
+        (settings.token, settings.cookie_header, *cookie_values),
+    )
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(formatter)
+
+    # httpx logs full request URLs at INFO. Telegram Bot API URLs contain the
+    # bot token, so dependency request logging must never inherit root INFO.
+    for logger_name in ("httpx", "httpcore", "telegram.request"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+
 def parse_gallery_url(raw_url: str) -> tuple[str, str, str]:
     """Return (host, gid, token), accepting only a complete canonical URL."""
     parsed = urlparse(raw_url.strip())
@@ -930,11 +967,8 @@ class BotService:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
     settings = Settings.from_env()
+    configure_logging(settings)
     service = BotService(settings)
     app = (
         Application.builder()

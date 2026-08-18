@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from bot import (
     ArchiveClient,
     ArchiveJob,
     BotService,
+    SecretRedactingFormatter,
     Settings,
     archive_link_from_html,
     download_progress_message,
@@ -89,6 +91,28 @@ def test_cookie_header_parser_keeps_only_required_site_cookies():
     assert parse_cookie_header(
         "unrelated=one; ipb_member_id=123; ipb_pass_hash=two=three; igneous=gate"
     ) == {"ipb_member_id": "123", "ipb_pass_hash": "two=three", "igneous": "gate"}
+
+
+def test_log_formatter_redacts_bot_token_and_cookie_values():
+    formatter = SecretRedactingFormatter(
+        "%(levelname)s %(message)s",
+        ("123456:telegram-secret", "cookie-secret"),
+    )
+    record = logging.LogRecord(
+        name="httpx",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="POST https://api.telegram.org/bot%s/getMe cookie=%s",
+        args=("123456:telegram-secret", "cookie-secret"),
+        exc_info=None,
+    )
+
+    rendered = formatter.format(record)
+
+    assert "123456:telegram-secret" not in rendered
+    assert "cookie-secret" not in rendered
+    assert rendered.count("<redacted>") == 2
 
 
 def test_completed_link_is_resolved_and_external_link_is_rejected():
