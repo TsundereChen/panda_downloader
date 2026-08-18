@@ -149,6 +149,14 @@ def test_completed_link_is_resolved_and_external_link_is_rejected():
     )
 
 
+def test_official_download_link_replaces_autostart_with_start():
+    assert archive_link_from_html(
+        '<div id="db"><p><a href="/archive/12?token=abc&amp;autostart=1">'
+        "Start download</a></p></div>",
+        "https://e-hentai.org/download-page",
+    ) == "https://e-hentai.org/archive/12?token=abc&start=1"
+
+
 def test_filename_content_disposition():
     request = httpx.Request("GET", "https://example.test/file")
     response = httpx.Response(
@@ -381,30 +389,28 @@ def test_archive_client_complete_flow(tmp_path):
 
 
 def test_archive_preparation_reports_every_status_check(monkeypatch, tmp_path):
-    archiver_gets = 0
+    archive_posts = 0
     archive_bytes = b"PK\x03\x04archive"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal archiver_gets
+        nonlocal archive_posts
         if request.method == "GET" and request.url.path == "/archiver.php":
-            archiver_gets += 1
-            if archiver_gets == 1:
-                return httpx.Response(
-                    200,
-                    text=(
-                        '<form action="/archiver.php">'
-                        '<input name="token" value="form-token">'
-                        '<input type="submit" name="download" value="Download">'
-                        "</form>"
-                    ),
-                )
-            if archiver_gets == 2:
-                return httpx.Response(200, text="Archive is still being generated")
+            return httpx.Response(
+                200,
+                text=(
+                    '<form action="/archiver.php">'
+                    '<input name="token" value="form-token">'
+                    '<input type="submit" name="download" value="Download">'
+                    "</form>"
+                ),
+            )
+        if request.method == "POST":
+            archive_posts += 1
+            if archive_posts < 3:
+                return httpx.Response(200, text="Archive is being generated")
             return httpx.Response(
                 200, text='<a href="/archive/file.zip">Download archive</a>'
             )
-        if request.method == "POST":
-            return httpx.Response(200, text="Archive is being generated")
         if request.url.path == "/archive/file.zip":
             return httpx.Response(
                 200,
@@ -435,6 +441,70 @@ def test_archive_preparation_reports_every_status_check(monkeypatch, tmp_path):
     assert "status check #1" in preparation_messages[0]
     assert "status check #2" in preparation_messages[1]
     assert any("stage 2/2" in message for message in messages)
+
+
+def test_archive_client_follows_jhentai_official_flow(monkeypatch, tmp_path):
+    calls = []
+    archive_posts = 0
+    archive_bytes = b"PK\x03\x04archive"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal archive_posts
+        calls.append((request.method, request.url.path, request.url.query))
+        if request.method == "GET" and request.url.path == "/archiver.php":
+            return httpx.Response(200, text='<form action="/archiver.php"></form>')
+        if request.method == "POST" and request.url.path == "/archiver.php":
+            archive_posts += 1
+            assert request.headers["content-type"].startswith("multipart/form-data;")
+            assert b'name="dltype"' in request.content
+            assert b"org" in request.content
+            assert b'name="dlcheck"' in request.content
+            assert b"Download Original Archive" in request.content
+            if archive_posts == 1:
+                return httpx.Response(200, text="Archive is being generated")
+            return httpx.Response(
+                200,
+                text='<div id="continue"><a href="/download-page">Continue</a></div>',
+            )
+        if request.url.path == "/download-page":
+            return httpx.Response(
+                200,
+                text=(
+                    '<div id="db"><p><a '
+                    'href="/archive/12?token=abc&amp;autostart=1">Download</a></p></div>'
+                ),
+            )
+        if request.url.path == "/archive/12":
+            assert request.url.params.get("token") == "abc"
+            assert request.url.params.get("start") == "1"
+            assert "autostart" not in request.url.params
+            return httpx.Response(
+                200,
+                content=archive_bytes,
+                headers={"content-type": "application/zip"},
+            )
+        raise AssertionError(f"unexpected request: {request}")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    client = ArchiveClient(
+        make_settings(tmp_path), transport=httpx.MockTransport(handler)
+    )
+
+    result = asyncio.run(
+        client.download("https://e-hentai.org/g/12/abcdef/", AsyncMock())
+    )
+
+    assert result.read_bytes() == archive_bytes
+    assert [call[:2] for call in calls] == [
+        ("GET", "/archiver.php"),
+        ("POST", "/archiver.php"),
+        ("POST", "/archiver.php"),
+        ("GET", "/download-page"),
+        ("GET", "/archive/12"),
+    ]
 
 
 def test_exhentai_download_requires_igneous_before_network_access(tmp_path):

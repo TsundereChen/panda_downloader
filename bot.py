@@ -18,7 +18,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from uuid import uuid4
 
 import httpx
@@ -333,8 +333,31 @@ def validate_outbound_url(url: str, allowed_hosts: frozenset[str]) -> str:
 def archive_link_from_html(
     html: str, page_url: str, allowed_hosts: frozenset[str] = SUPPORTED_GALLERY_HOSTS
 ) -> str | None:
-    """Find a completed archive link while enforcing the outbound host policy."""
+    """Find the next official archive link and normalize the final download URL."""
     soup = BeautifulSoup(html, "html.parser")
+
+    # The official flow first returns a continuation page, then a download page.
+    # Match the same elements as JHentai before falling back to text heuristics.
+    for selector, is_download_link in (
+        ("#continue > a[href]", False),
+        ("#db > p > a[href]", True),
+    ):
+        anchor = soup.select_one(selector)
+        if anchor is None:
+            continue
+        href = urljoin(page_url, anchor["href"])
+        try:
+            href = validate_outbound_url(href, allowed_hosts)
+        except RuntimeError:
+            continue
+        if is_download_link:
+            parsed = urlparse(href)
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query.pop("autostart", None)
+            query.setdefault("start", "1")
+            href = urlunparse(parsed._replace(query=urlencode(query)))
+        return href
+
     for anchor in soup.select("a[href]"):
         href = urljoin(page_url, anchor["href"])
         parsed = urlparse(href)
@@ -472,12 +495,13 @@ class ArchiveClient:
                     self.settings.archive_download_hosts,
                 )
                 if link:
+                    referer = str(response.url)
                     await response.aclose()
                     response = await self._request(
                         client,
                         "GET",
                         link,
-                        headers={"Referer": f"https://{host}/"},
+                        headers={"Referer": referer},
                     )
                     continue
 
@@ -500,8 +524,8 @@ class ArchiveClient:
                 )
                 await response.aclose()
                 await asyncio.sleep(next_check_seconds)
-                response = await self._request(
-                    client, "GET", archiver_url, headers={"Referer": gallery_url}
+                response = await self._submit_archive_request(
+                    client, page_html, archiver_url, gallery_url
                 )
 
     async def _request(
@@ -640,19 +664,20 @@ class ArchiveClient:
                 "Could not find the archive form. Check that the account is eligible for archive downloads."
             )
         data = {
-            str(input_tag.get("name")): input_tag.get("value", "")
-            for input_tag in form.select("input[name]")
-            if input_tag.get("type", "").lower() not in {"submit", "button"}
+            "dltype": self.settings.archive_type,
+            "dlcheck": (
+                "Download Original Archive"
+                if self.settings.archive_type == "org"
+                else "Download Resample Archive"
+            ),
         }
-        data["dltype"] = self.settings.archive_type
-        submit = form.select_one(
-            'input[type="submit"][name], button[type="submit"][name]'
-        )
-        if submit and submit.get("name"):
-            data[str(submit["name"])] = submit.get("value", "Download")
         action = validate_outbound_url(action, SUPPORTED_GALLERY_HOSTS)
         return await self._request(
-            client, "POST", action, data=data, headers={"Referer": gallery_url}
+            client,
+            "POST",
+            action,
+            files={name: (None, value) for name, value in data.items()},
+            headers={"Referer": gallery_url},
         )
 
     @staticmethod
