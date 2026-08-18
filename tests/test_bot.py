@@ -15,6 +15,7 @@ from bot import (
     ArchiveClient,
     ArchiveJob,
     BotService,
+    GalleryPreview,
     SecretRedactingFormatter,
     Settings,
     archive_html_state,
@@ -25,6 +26,8 @@ from bot import (
     extract_gallery_url,
     filename_from_response,
     format_bytes,
+    gallery_confirmation_caption,
+    gallery_preview_from_html,
     normalize_cookie_header,
     parse_cookie_header,
     parse_gallery_url,
@@ -62,6 +65,22 @@ def fake_update(user_id: int, chat_type: str = ChatType.PRIVATE):
     )
 
 
+def stub_gallery_preview(
+    service: BotService, *, image: bytes | None = None
+) -> GalleryPreview:
+    preview = GalleryPreview(
+        gallery_name="日本語のタイトル",
+        english_name="English Gallery Title",
+        language="Japanese",
+        file_size="42.0 MiB",
+        length="123 pages",
+        image_url="https://ehgt.org/g/cover.jpg",
+        image=image,
+    )
+    service.client.gallery_preview = AsyncMock(return_value=preview)
+    return preview
+
+
 def test_gallery_url_parser_accepts_both_hosts_and_query():
     assert parse_gallery_url("https://e-hentai.org/g/12/abcDEF/") == (
         "e-hentai.org",
@@ -92,6 +111,51 @@ def test_gallery_url_parser_rejects_untrusted_or_noncanonical_urls(url):
 def test_extract_gallery_url_skips_other_links_and_trailing_punctuation():
     text = "See https://example.com first, then (https://e-hentai.org/g/12/abcdef/)."
     assert extract_gallery_url(text) == "https://e-hentai.org/g/12/abcdef/"
+
+
+def test_gallery_preview_parser_extracts_titles_details_and_cover():
+    preview = gallery_preview_from_html(
+        """
+        <h1 id="gn">English Gallery Title</h1>
+        <h1 id="gj">日本語のタイトル</h1>
+        <div id="gd1"><div style="width:240px; height:320px; background:url(https://ehgt.org/g/cover.jpg)"></div></div>
+        <div id="gdd"><table>
+          <tr><td class="gdt1">Language:</td><td class="gdt2">Japanese <span>TR</span></td></tr>
+          <tr><td class="gdt1">File Size:</td><td class="gdt2">42.0 MiB</td></tr>
+          <tr><td class="gdt1">Length:</td><td class="gdt2">123 pages</td></tr>
+        </table></div>
+        """,
+        "https://e-hentai.org/g/12/abcdef/",
+    )
+
+    assert preview.gallery_name == "日本語のタイトル"
+    assert preview.english_name == "English Gallery Title"
+    assert preview.language == "Japanese"
+    assert preview.file_size == "42.0 MiB"
+    assert preview.length == "123 pages"
+    assert preview.image_url == "https://ehgt.org/g/cover.jpg"
+
+
+def test_gallery_confirmation_caption_contains_requested_metadata_and_is_bounded():
+    preview = GalleryPreview(
+        gallery_name="日" * 500,
+        english_name="English title",
+        language="Japanese",
+        file_size="42.0 MiB",
+        length="123 pages",
+        image_url=None,
+    )
+
+    caption = gallery_confirmation_caption(
+        preview, "https://e-hentai.org/g/12/abcdef/", "original files"
+    )
+
+    assert "Gallery name:" in caption
+    assert "English name: English title" in caption
+    assert "Language: Japanese" in caption
+    assert "File size: 42.0 MiB" in caption
+    assert "Length: 123 pages" in caption
+    assert len(caption) <= 1024
 
 
 def test_cookie_header_parser_keeps_only_required_site_cookies():
@@ -293,6 +357,7 @@ def test_unauthorized_user_receives_no_response(tmp_path):
 
 def test_gallery_handler_prompts_before_queueing(tmp_path):
     service = BotService(make_settings(tmp_path))
+    stub_gallery_preview(service)
     update = fake_update(123)
     update.effective_message.text = "https://e-hentai.org/g/12/abcdef/"
 
@@ -309,8 +374,26 @@ def test_gallery_handler_prompts_before_queueing(tmp_path):
     ]
 
 
+def test_gallery_handler_sends_cover_photo_with_metadata(tmp_path):
+    service = BotService(make_settings(tmp_path))
+    stub_gallery_preview(service, image=b"preview-image")
+    update = fake_update(123)
+    update.effective_message.text = "https://e-hentai.org/g/12/abcdef/"
+
+    asyncio.run(service.gallery_message(update, None))
+
+    photo_call = update.effective_message.reply_photo.await_args
+    assert "Gallery name: 日本語のタイトル" in photo_call.kwargs["caption"]
+    assert "English name: English Gallery Title" in photo_call.kwargs["caption"]
+    assert "Language: Japanese" in photo_call.kwargs["caption"]
+    assert "File size: 42.0 MiB" in photo_call.kwargs["caption"]
+    assert "Length: 123 pages" in photo_call.kwargs["caption"]
+    update.effective_message.reply_text.assert_not_awaited()
+
+
 def test_confirmation_queues_download(tmp_path):
     service = BotService(make_settings(tmp_path))
+    stub_gallery_preview(service)
     message_update = fake_update(123)
     message_update.effective_message.text = "https://e-hentai.org/g/12/abcdef/"
     asyncio.run(service.gallery_message(message_update, None))
@@ -335,6 +418,7 @@ def test_confirmation_queues_download(tmp_path):
 
 def test_cancelling_confirmation_does_not_queue(tmp_path):
     service = BotService(make_settings(tmp_path))
+    stub_gallery_preview(service)
     message_update = fake_update(123)
     message_update.effective_message.text = "https://e-hentai.org/g/12/abcdef/"
     asyncio.run(service.gallery_message(message_update, None))
@@ -373,6 +457,7 @@ def test_unknown_confirmation_is_reported_as_expired(tmp_path):
 def test_confirmation_cannot_be_used_by_another_approved_user(tmp_path):
     settings = make_settings(tmp_path, allowed_user_ids=frozenset({123, 456}))
     service = BotService(settings)
+    stub_gallery_preview(service)
     message_update = fake_update(123)
     message_update.effective_message.text = "https://e-hentai.org/g/12/abcdef/"
     asyncio.run(service.gallery_message(message_update, None))

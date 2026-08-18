@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import (
     CallbackQuery,
+    InputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -51,6 +52,9 @@ SUPPORTED_GALLERY_HOSTS: Final = frozenset({"e-hentai.org", "exhentai.org"})
 DEFAULT_ARCHIVE_DOWNLOAD_HOSTS: Final = frozenset(
     {*SUPPORTED_GALLERY_HOSTS, "hath.network"}
 )
+DEFAULT_GALLERY_IMAGE_HOSTS: Final = frozenset(
+    {*SUPPORTED_GALLERY_HOSTS, "ehgt.org"}
+)
 KNOWN_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash", "igneous"})
 REQUIRED_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash"})
 GALLERY_PATH_RE: Final = re.compile(r"^/g/(?P<gid>\d+)/(?P<token>[0-9a-fA-F]+)/?$")
@@ -66,6 +70,8 @@ AUTH_FAILURE_MARKERS: Final = (
 )
 RETRYABLE_STATUS_CODES: Final = frozenset({429, 500, 502, 503, 504})
 MAX_HTML_BYTES: Final = 2 * 1024 * 1024
+MAX_GALLERY_PREVIEW_BYTES: Final = 10 * 1024 * 1024
+MAX_TELEGRAM_CAPTION_CHARS: Final = 1024
 CONFIRMATION_TTL_SECONDS: Final = 10 * 60
 PROGRESS_UPDATE_SECONDS: Final = 2.0
 ARCHIVE_POLL_SECONDS: Final = 5
@@ -578,6 +584,85 @@ class PendingDownload:
     created_at: float
 
 
+@dataclass(frozen=True)
+class GalleryPreview:
+    gallery_name: str
+    english_name: str
+    language: str
+    file_size: str
+    length: str
+    image_url: str | None
+    image: bytes | None = None
+
+
+def gallery_preview_from_html(html: str, page_url: str) -> GalleryPreview:
+    """Parse the decision-making metadata shown on an official gallery page."""
+    soup = BeautifulSoup(html, "html.parser")
+    english_name = soup.select_one("#gn")
+    gallery_name = soup.select_one("#gj")
+    english_text = english_name.get_text(" ", strip=True) if english_name else ""
+    gallery_text = gallery_name.get_text(" ", strip=True) if gallery_name else ""
+
+    details: dict[str, str] = {}
+    for row in soup.select("#gdd tr"):
+        label = row.select_one(".gdt1")
+        value = row.select_one(".gdt2")
+        if label is None or value is None:
+            continue
+        key = label.get_text(" ", strip=True).rstrip(":").lower()
+        if key == "language":
+            direct_text = value.find(string=True, recursive=False)
+            details[key] = (
+                str(direct_text).strip()
+                if direct_text and str(direct_text).strip()
+                else value.get_text(" ", strip=True)
+            )
+        else:
+            details[key] = value.get_text(" ", strip=True)
+
+    image_url: str | None = None
+    image = soup.select_one("#gd1 img[src]")
+    if image is not None:
+        image_url = urljoin(page_url, str(image["src"]))
+    else:
+        cover = soup.select_one("#gd1 > div[style]")
+        style = str(cover.get("style", "")) if cover is not None else ""
+        match = re.search(r"url\(\s*(['\"]?)(.*?)\1\s*\)", style, re.IGNORECASE)
+        if match and match.group(2).strip():
+            image_url = urljoin(page_url, match.group(2).strip())
+
+    return GalleryPreview(
+        gallery_name=gallery_text or english_text or "Unknown",
+        english_name=english_text or gallery_text or "Unknown",
+        language=details.get("language") or "Unknown",
+        file_size=details.get("file size") or "Unknown",
+        length=details.get("length") or "Unknown",
+        image_url=image_url,
+    )
+
+
+def gallery_confirmation_caption(
+    preview: GalleryPreview, gallery_url: str, archive_label: str
+) -> str:
+    """Build a bounded Telegram photo caption with the requested metadata."""
+    def shortened(value: str, limit: int = 280) -> str:
+        return value if len(value) <= limit else f"{value[: limit - 1]}…"
+
+    caption = (
+        "Download this gallery?\n\n"
+        f"Gallery name: {shortened(preview.gallery_name)}\n"
+        f"English name: {shortened(preview.english_name)}\n"
+        f"Language: {preview.language}\n"
+        f"File size: {preview.file_size}\n"
+        f"Length: {preview.length}\n"
+        f"Archive: {archive_label}\n\n"
+        f"{gallery_url}"
+    )
+    if len(caption) <= MAX_TELEGRAM_CAPTION_CHARS:
+        return caption
+    return f"{caption[: MAX_TELEGRAM_CAPTION_CHARS - 1]}…"
+
+
 class ArchiveClient:
     def __init__(
         self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None
@@ -608,6 +693,78 @@ class ArchiveClient:
             headers={"User-Agent": "Mozilla/5.0 (compatible; PersonalArchiveBot/1.0)"},
             transport=self.transport,
         )
+
+    async def gallery_preview(self, raw_url: str) -> GalleryPreview:
+        """Fetch gallery metadata and its cover through the authenticated session."""
+        host, gid, gallery_token = parse_gallery_url(raw_url)
+        validate_cookie_header(self.settings.cookie_header, host)
+        gallery_url = f"https://{host}/g/{gid}/{gallery_token}/"
+        LOG.info("gallery_preview step=page_request_start host=%s", host)
+
+        async with self._client() as client:
+            page = await self._request(client, "GET", gallery_url)
+            try:
+                page_html = await self._read_html(page)
+                self._raise_for_site_error(page, page_html)
+                preview = gallery_preview_from_html(page_html, gallery_url)
+                LOG.info(
+                    "gallery_preview step=metadata_parsed image_present=%s",
+                    preview.image_url is not None,
+                )
+            finally:
+                await page.aclose()
+
+            if preview.image_url is None:
+                return preview
+
+            try:
+                image_response = await self._request(
+                    client,
+                    "GET",
+                    preview.image_url,
+                    allowed_hosts=DEFAULT_GALLERY_IMAGE_HOSTS,
+                    headers={"Referer": gallery_url},
+                )
+                try:
+                    image = await self._read_gallery_image(image_response)
+                finally:
+                    await image_response.aclose()
+            except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+                LOG.warning(
+                    "gallery_preview step=image_fetch_failed error_type=%s error=%s",
+                    type(exc).__name__,
+                    exc,
+                )
+                return preview
+
+            LOG.info(
+                "gallery_preview step=image_fetch_complete bytes=%s",
+                len(image) if image is not None else 0,
+            )
+            return replace(preview, image=image)
+
+    @staticmethod
+    async def _read_gallery_image(response: httpx.Response) -> bytes | None:
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").lower()
+        if not content_type.startswith("image/"):
+            raise RuntimeError("The gallery preview was not an image.")
+        content_length = response.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_GALLERY_PREVIEW_BYTES:
+                    raise RuntimeError("The gallery preview image is too large.")
+            except ValueError:
+                LOG.warning("Ignoring malformed gallery preview Content-Length")
+
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in response.aiter_bytes():
+            received += len(chunk)
+            if received > MAX_GALLERY_PREVIEW_BYTES:
+                raise RuntimeError("The gallery preview image is too large.")
+            chunks.append(chunk)
+        return b"".join(chunks) or None
 
     async def download(self, raw_url: str, progress: ProgressCallback) -> Path:
         host, gid, gallery_token = parse_gallery_url(raw_url)
@@ -737,11 +894,18 @@ class ArchiveClient:
                 )
 
     async def _request(
-        self, client: httpx.AsyncClient, method: str, url: str, **kwargs
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        *,
+        allowed_hosts: frozenset[str] | None = None,
+        **kwargs,
     ) -> httpx.Response:
         """Send a streamed request with safe redirects and bounded GET retries."""
+        trusted_hosts = allowed_hosts or self.settings.archive_download_hosts
         current_method = method.upper()
-        current_url = validate_outbound_url(url, self.settings.archive_download_hosts)
+        current_url = validate_outbound_url(url, trusted_hosts)
         current_kwargs = dict(kwargs)
         LOG.info(
             "http step=request_start method=%s location=%s",
@@ -768,7 +932,7 @@ class ArchiveClient:
                 return response
             next_url = validate_outbound_url(
                 urljoin(str(response.url), location),
-                self.settings.archive_download_hosts,
+                trusted_hosts,
             )
             LOG.info(
                 "http step=redirect_follow status=%s next_location=%s",
@@ -1226,7 +1390,11 @@ class BotService:
         LOG.info("telegram step=notice_edit_start message_chars=%s", len(message))
         for attempt in range(3):
             try:
-                await notice.edit_text(message, reply_markup=None)
+                photo = getattr(notice, "photo", None)
+                if isinstance(photo, (list, tuple)) and photo:
+                    await notice.edit_caption(caption=message, reply_markup=None)
+                else:
+                    await notice.edit_text(message, reply_markup=None)
                 LOG.info(
                     "telegram step=notice_edit_complete attempt=%s",
                     attempt + 1,
@@ -1399,7 +1567,7 @@ class BotService:
             "bot step=gallery_url_accepted host=%s",
             urlparse(gallery_url).hostname,
         )
-        await message.reply_chat_action(ChatAction.TYPING)
+        await message.reply_chat_action(ChatAction.UPLOAD_PHOTO)
         self._prune_pending_downloads()
         if len(self.pending_downloads) >= self.settings.queue_size:
             LOG.warning("bot step=confirmation_rejected reason=capacity")
@@ -1427,10 +1595,44 @@ class BotService:
                 ]
             ]
         )
-        await message.reply_text(
-            f"Download this gallery?\n\n{gallery_url}\n\nArchive: {archive_label}",
-            reply_markup=keyboard,
-        )
+        try:
+            preview = await self.client.gallery_preview(gallery_url)
+            LOG.info(
+                "bot step=gallery_preview_loaded image_present=%s",
+                preview.image is not None,
+            )
+        except (httpx.HTTPError, RuntimeError, ValueError) as exc:
+            LOG.warning(
+                "bot step=gallery_preview_failed error_type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
+            preview = GalleryPreview(
+                gallery_name="Unavailable",
+                english_name="Unavailable",
+                language="Unknown",
+                file_size="Unknown",
+                length="Unknown",
+                image_url=None,
+            )
+
+        caption = gallery_confirmation_caption(preview, gallery_url, archive_label)
+        if preview.image is not None:
+            try:
+                await message.reply_photo(
+                    photo=InputFile(preview.image, filename="gallery-preview"),
+                    caption=caption,
+                    reply_markup=keyboard,
+                )
+                LOG.info("bot step=confirmation_photo_sent")
+            except TelegramError:
+                LOG.warning(
+                    "bot step=confirmation_photo_failed fallback=text",
+                    exc_info=True,
+                )
+                await message.reply_text(caption, reply_markup=keyboard)
+        else:
+            await message.reply_text(caption, reply_markup=keyboard)
         self.pending_downloads[request_id] = PendingDownload(
             url=gallery_url,
             user_id=update.effective_user.id,

@@ -86,12 +86,14 @@ forward a message containing a canonical gallery URL:
 https://e-hentai.org/g/123456/abcdef1234/
 ```
 
-The bot first shows a confirmation prompt with **Yes, download** and **No,
-cancel** buttons. Only a confirmed request enters the queue. It processes one
-archive at a time while remaining responsive to `/status`, then updates the
-same message every five seconds while checking archive preparation before
-showing downloaded bytes and percentage when the total size is known,
-validation state, and a clear success or failure result.
+The bot first shows the gallery's cover, gallery and English names, language,
+file size, and page count with **Yes, download** and **No, cancel** buttons. If
+the cover cannot be fetched, the same metadata is sent as a text confirmation.
+Only a confirmed request enters the queue. It processes one archive at a time
+while remaining responsive to `/status`, then updates the same message every
+five seconds while checking archive preparation before showing downloaded
+bytes and percentage when the total size is known, validation state, and a
+clear success or failure result.
 
 It requests an `org` archive by default, waits for the site to prepare it,
 validates the result, and atomically writes it to `DOWNLOAD_DIR`. Change
