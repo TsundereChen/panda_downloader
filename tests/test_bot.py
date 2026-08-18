@@ -327,10 +327,10 @@ def test_download_progress_formatting():
 
 
 def test_archive_preparation_progress_formatting():
-    assert archive_preparation_progress_message(75, 6, 15) == (
+    assert archive_preparation_progress_message(75, 6, 5) == (
         "⏳ Preparing archive — stage 1/2\n"
         "Elapsed: 1m 15s • status check #6\n"
-        "Next update in 15s"
+        "Next update in 5s"
     )
 
 

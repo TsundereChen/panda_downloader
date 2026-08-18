@@ -89,9 +89,9 @@ https://e-hentai.org/g/123456/abcdef1234/
 The bot first shows a confirmation prompt with **Yes, download** and **No,
 cancel** buttons. Only a confirmed request enters the queue. It processes one
 archive at a time while remaining responsive to `/status`, then updates the
-same message on every archive-preparation status check before showing downloaded
-bytes and percentage when the total size is known, validation state, and a
-clear success or failure result.
+same message every five seconds while checking archive preparation before
+showing downloaded bytes and percentage when the total size is known,
+validation state, and a clear success or failure result.
 
 It requests an `org` archive by default, waits for the site to prepare it,
 validates the result, and atomically writes it to `DOWNLOAD_DIR`. Change
