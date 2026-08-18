@@ -61,6 +61,7 @@ RETRYABLE_STATUS_CODES: Final = frozenset({429, 500, 502, 503, 504})
 MAX_HTML_BYTES: Final = 2 * 1024 * 1024
 CONFIRMATION_TTL_SECONDS: Final = 10 * 60
 PROGRESS_UPDATE_SECONDS: Final = 2.0
+ARCHIVE_POLL_SECONDS: Final = 15
 ARCHIVE_SIGNATURES: Final = (
     (b"PK\x03\x04", ".zip"),
     (b"PK\x05\x06", ".zip"),
@@ -368,14 +369,38 @@ def format_bytes(byte_count: int) -> str:
     raise AssertionError("unreachable")
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {remaining_seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {remaining_seconds:02d}s"
+    return f"{remaining_seconds}s"
+
+
+def archive_preparation_progress_message(
+    elapsed_seconds: float, check_count: int, next_check_seconds: int
+) -> str:
+    return (
+        "⏳ Preparing archive — stage 1/2\n"
+        f"Elapsed: {format_duration(elapsed_seconds)} • status check #{check_count}\n"
+        f"Next update in {next_check_seconds}s"
+    )
+
+
 def download_progress_message(filename: str, downloaded: int, total: int | None) -> str:
     if total is not None and total > 0:
         percentage = min(100, int(downloaded * 100 / total))
         return (
-            f"⬇️ Downloading {filename}\n"
+            f"⬇️ Downloading {filename} — stage 2/2\n"
             f"{percentage}% — {format_bytes(downloaded)} / {format_bytes(total)}"
         )
-    return f"⬇️ Downloading {filename}\nReceived {format_bytes(downloaded)}"
+    return (
+        f"⬇️ Downloading {filename} — stage 2/2\n"
+        f"Received {format_bytes(downloaded)}"
+    )
 
 
 @dataclass
@@ -431,8 +456,9 @@ class ArchiveClient:
                 client, page_html, archiver_url, gallery_url
             )
             await page.aclose()
-            deadline = time.monotonic() + self.settings.wait_seconds
-            announced_wait = False
+            preparation_started_at = time.monotonic()
+            deadline = preparation_started_at + self.settings.wait_seconds
+            check_count = 0
 
             while True:
                 if is_archive_response(response):
@@ -455,18 +481,25 @@ class ArchiveClient:
                     )
                     continue
 
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if now >= deadline:
                     await response.aclose()
                     raise RuntimeError(
                         "The archive was not ready before the configured wait limit."
                     )
-                if not announced_wait:
-                    await progress(
-                        "The site is preparing the archive; I’ll keep checking."
+                check_count += 1
+                next_check_seconds = max(
+                    1, min(ARCHIVE_POLL_SECONDS, int(deadline - now))
+                )
+                await progress(
+                    archive_preparation_progress_message(
+                        now - preparation_started_at,
+                        check_count,
+                        next_check_seconds,
                     )
-                    announced_wait = True
+                )
                 await response.aclose()
-                await asyncio.sleep(15)
+                await asyncio.sleep(next_check_seconds)
                 response = await self._request(
                     client, "GET", archiver_url, headers={"Referer": gallery_url}
                 )

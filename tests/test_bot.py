@@ -16,6 +16,7 @@ from bot import (
     SecretRedactingFormatter,
     Settings,
     archive_link_from_html,
+    archive_preparation_progress_message,
     download_progress_message,
     extract_gallery_url,
     filename_from_response,
@@ -319,9 +320,18 @@ def test_confirmation_cannot_be_used_by_another_approved_user(tmp_path):
 def test_download_progress_formatting():
     assert format_bytes(1536) == "1.5 KiB"
     assert download_progress_message("gallery.zip", 512, 1024) == (
-        "⬇️ Downloading gallery.zip\n50% — 512 B / 1.0 KiB"
+        "⬇️ Downloading gallery.zip — stage 2/2\n"
+        "50% — 512 B / 1.0 KiB"
     )
     assert "Received 512 B" in download_progress_message("gallery.zip", 512, None)
+
+
+def test_archive_preparation_progress_formatting():
+    assert archive_preparation_progress_message(75, 6, 15) == (
+        "⏳ Preparing archive — stage 1/2\n"
+        "Elapsed: 1m 15s • status check #6\n"
+        "Next update in 15s"
+    )
 
 
 def test_archive_client_complete_flow(tmp_path):
@@ -368,6 +378,63 @@ def test_archive_client_complete_flow(tmp_path):
         ("POST", "/archiver.php"),
         ("GET", "/archive/file.zip"),
     ]
+
+
+def test_archive_preparation_reports_every_status_check(monkeypatch, tmp_path):
+    archiver_gets = 0
+    archive_bytes = b"PK\x03\x04archive"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal archiver_gets
+        if request.method == "GET" and request.url.path == "/archiver.php":
+            archiver_gets += 1
+            if archiver_gets == 1:
+                return httpx.Response(
+                    200,
+                    text=(
+                        '<form action="/archiver.php">'
+                        '<input name="token" value="form-token">'
+                        '<input type="submit" name="download" value="Download">'
+                        "</form>"
+                    ),
+                )
+            if archiver_gets == 2:
+                return httpx.Response(200, text="Archive is still being generated")
+            return httpx.Response(
+                200, text='<a href="/archive/file.zip">Download archive</a>'
+            )
+        if request.method == "POST":
+            return httpx.Response(200, text="Archive is being generated")
+        if request.url.path == "/archive/file.zip":
+            return httpx.Response(
+                200,
+                content=archive_bytes,
+                headers={
+                    "content-type": "application/zip",
+                    "content-length": str(len(archive_bytes)),
+                },
+            )
+        raise AssertionError(f"unexpected request: {request}")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    client = ArchiveClient(
+        make_settings(tmp_path), transport=httpx.MockTransport(handler)
+    )
+    progress = AsyncMock()
+
+    asyncio.run(client.download("https://e-hentai.org/g/12/abcdef/", progress))
+
+    messages = [call.args[0] for call in progress.await_args_list]
+    preparation_messages = [
+        message for message in messages if "Preparing archive" in message
+    ]
+    assert len(preparation_messages) == 2
+    assert "status check #1" in preparation_messages[0]
+    assert "status check #2" in preparation_messages[1]
+    assert any("stage 2/2" in message for message in messages)
 
 
 def test_exhentai_download_requires_igneous_before_network_access(tmp_path):
