@@ -113,5 +113,10 @@ list are rejected.
   completed archives are never silently overwritten.
 - Archive preparation uses bounded retries for transient GET failures and honors
   numeric `Retry-After` values up to 30 seconds.
+- The bot logs sanitized archive, HTTP, Telegram, queue, storage, and lifecycle
+  steps. It also logs every call and return for functions defined in `bot.py`
+  without argument or return values. Set `FUNCTION_TRACE_LOGGING=false` to turn
+  off call-level tracing while retaining workflow logs. URLs in logs omit query
+  parameters, and configured credentials are redacted.
 - Run this only on a machine you control. For a persistent service, use an
   absolute `DOWNLOAD_DIR` on a monitored filesystem.

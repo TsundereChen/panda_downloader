@@ -8,10 +8,13 @@ individual gallery images are never scraped or uploaded to Telegram.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import shutil
+import sys
+import threading
 import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -43,6 +46,7 @@ from telegram.ext import (
 )
 
 LOG = logging.getLogger(__name__)
+APP_SOURCE_FILE: Final = str(Path(__file__).resolve())
 SUPPORTED_GALLERY_HOSTS: Final = frozenset({"e-hentai.org", "exhentai.org"})
 KNOWN_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash", "igneous"})
 REQUIRED_COOKIE_NAMES: Final = frozenset({"ipb_member_id", "ipb_pass_hash"})
@@ -70,6 +74,94 @@ ARCHIVE_SIGNATURES: Final = (
     (b"7z\xbc\xaf\x27\x1c", ".7z"),
 )
 ProgressCallback = Callable[[str], Awaitable[None]]
+
+
+def _function_trace_profile(frame, event: str, arg) -> None:
+    """Log calls and returns for functions defined in this application module."""
+    if event not in {"call", "return"} or frame.f_code.co_filename != APP_SOURCE_FILE:
+        return
+    function_name = frame.f_code.co_qualname
+    if function_name in {
+        "_function_trace_profile",
+        "SecretRedactingFormatter.format",
+    }:
+        return
+    LOG.info("function event=%s name=%s", event, function_name)
+
+
+def enable_function_call_logging() -> None:
+    """Enable argument-free function tracing unless explicitly disabled."""
+    enabled = os.getenv("FUNCTION_TRACE_LOGGING", "true").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        LOG.info("function tracing disabled by FUNCTION_TRACE_LOGGING")
+        return
+    sys.setprofile(_function_trace_profile)
+    threading.setprofile(_function_trace_profile)
+    LOG.info(
+        "function tracing enabled for application functions; arguments and return values are omitted"
+    )
+
+
+def safe_url_for_log(url: str) -> str:
+    """Return a URL location without credentials, query parameters, or fragments."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "unknown").lower().rstrip(".")
+    return f"{parsed.scheme.lower() or 'unknown'}://{host}{parsed.path or '/'}"
+
+
+def archive_html_state(html: str) -> str:
+    """Describe archive HTML structurally without logging page content."""
+    soup = BeautifulSoup(html, "html.parser")
+    input_names = {
+        str(input_tag.get("name", "")).lower()
+        for input_tag in soup.select("input[name]")
+    }
+    login_form = any(
+        "password" in {
+            str(input_tag.get("name", "")).lower()
+            for input_tag in form.select("input[name]")
+        }
+        for form in soup.find_all("form")
+    )
+    normalized = soup.get_text(" ", strip=True).lower()
+    waiting_marker = any(
+        marker in normalized
+        for marker in ("being generated", "preparing", "please wait", "not ready")
+    )
+    body_hash = hashlib.sha256(html.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return (
+        f"html_bytes={len(html.encode('utf-8', errors='replace'))} "
+        f"body_sha256={body_hash} forms={len(soup.find_all('form'))} "
+        f"dltype_field={'dltype' in input_names} "
+        f"dlcheck_field={'dlcheck' in input_names} "
+        f"continue_link={bool(soup.select_one('#continue > a[href]'))} "
+        f"download_link={bool(soup.select_one('#db > p > a[href]'))} "
+        f"login_form={login_form} waiting_marker={waiting_marker}"
+    )
+
+
+def log_response_step(
+    step: str,
+    response: httpx.Response,
+    *,
+    html: str | None = None,
+    check_count: int | None = None,
+) -> None:
+    """Log a sanitized HTTP/archive state transition."""
+    content_type = response.headers.get("content-type", "unknown").split(";", 1)[0]
+    LOG.info(
+        "archive step=%s method=%s location=%s status=%s content_type=%s "
+        "content_length=%s check=%s archive_response=%s%s",
+        step,
+        response.request.method,
+        safe_url_for_log(str(response.url)),
+        response.status_code,
+        content_type,
+        response.headers.get("content-length", "unknown"),
+        check_count if check_count is not None else "none",
+        is_archive_response(response),
+        f" {archive_html_state(html)}" if html is not None else "",
+    )
 
 
 def _positive_float_env(name: str, default: str) -> float:
@@ -191,6 +283,12 @@ class SecretRedactingFormatter(logging.Formatter):
         rendered = super().format(record)
         for secret in self.secrets_to_redact:
             rendered = rendered.replace(secret, "<redacted>")
+        rendered = re.sub(
+            r"(https?://[^\s?'\"<>]+)\?[^\s'\"<>]+",
+            r"\1?<redacted-query>",
+            rendered,
+            flags=re.IGNORECASE,
+        )
         return rendered
 
 
@@ -209,6 +307,10 @@ def configure_logging(settings: Settings) -> None:
     # bot token, so dependency request logging must never inherit root INFO.
     for logger_name in ("httpx", "httpcore", "telegram.request"):
         logging.getLogger(logger_name).setLevel(logging.WARNING)
+    LOG.info(
+        "logging configured level=%s dependency_request_logging=warning",
+        os.getenv("LOG_LEVEL", "INFO").upper(),
+    )
 
 
 def parse_gallery_url(raw_url: str) -> tuple[str, str, str]:
@@ -446,9 +548,18 @@ class ArchiveClient:
     ) -> None:
         self.settings = settings
         self.transport = transport
+        LOG.info(
+            "archive step=client_initialized transport=%s archive_type=%s",
+            "custom" if transport is not None else "network",
+            settings.archive_type,
+        )
 
     def _client(self) -> httpx.AsyncClient:
         cookies = parse_cookie_header(self.settings.cookie_header)
+        LOG.info(
+            "archive step=http_client_create cookie_names=%s",
+            ",".join(sorted(cookies)),
+        )
         jar = httpx.Cookies()
         for name, value in cookies.items():
             if name != "igneous":
@@ -464,39 +575,81 @@ class ArchiveClient:
 
     async def download(self, raw_url: str, progress: ProgressCallback) -> Path:
         host, gid, gallery_token = parse_gallery_url(raw_url)
+        LOG.info("archive step=download_start host=%s", host)
         validate_cookie_header(self.settings.cookie_header, host)
+        LOG.info("archive step=session_configuration_validated host=%s", host)
         gallery_url = f"https://{host}/g/{gid}/{gallery_token}/"
         archiver_url = f"https://{host}/archiver.php?gid={gid}&token={gallery_token}"
         self.settings.download_dir.mkdir(parents=True, exist_ok=True)
+        LOG.info("archive step=download_directory_ready")
 
         async with self._client() as client:
+            LOG.info("archive step=initial_archiver_request_start host=%s", host)
             page = await self._request(
                 client, "GET", archiver_url, headers={"Referer": gallery_url}
             )
+            log_response_step("initial_archiver_response", page)
             page_html = await self._read_html(page)
+            log_response_step("initial_archiver_html_read", page, html=page_html)
             self._raise_for_site_error(page, page_html)
+            LOG.info("archive step=initial_archiver_page_validated")
             response = await self._submit_archive_request(
                 client, page_html, archiver_url, gallery_url
             )
+            log_response_step("initial_unlock_response", response)
             await page.aclose()
+            LOG.info("archive step=initial_archiver_response_closed")
             preparation_started_at = time.monotonic()
             deadline = preparation_started_at + self.settings.wait_seconds
             check_count = 0
+            LOG.info(
+                "archive step=preparation_started wait_seconds=%s poll_seconds=%s",
+                self.settings.wait_seconds,
+                ARCHIVE_POLL_SECONDS,
+            )
 
             while True:
+                log_response_step(
+                    "preparation_response_received",
+                    response,
+                    check_count=check_count,
+                )
                 if is_archive_response(response):
+                    LOG.info(
+                        "archive step=stage_2_entered check=%s",
+                        check_count,
+                    )
                     return await self._save_response(response, gid, progress)
 
                 response_html = await self._read_html(response)
+                log_response_step(
+                    "preparation_html_read",
+                    response,
+                    html=response_html,
+                    check_count=check_count,
+                )
                 self._raise_for_site_error(response, response_html)
+                LOG.info(
+                    "archive step=preparation_response_validated check=%s",
+                    check_count,
+                )
                 link = archive_link_from_html(
                     response_html,
                     str(response.url),
                     self.settings.archive_download_hosts,
                 )
                 if link:
+                    LOG.info(
+                        "archive step=next_link_found check=%s location=%s",
+                        check_count,
+                        safe_url_for_log(link),
+                    )
                     referer = str(response.url)
                     await response.aclose()
+                    LOG.info(
+                        "archive step=preparation_response_closed check=%s",
+                        check_count,
+                    )
                     response = await self._request(
                         client,
                         "GET",
@@ -507,6 +660,11 @@ class ArchiveClient:
 
                 now = time.monotonic()
                 if now >= deadline:
+                    LOG.error(
+                        "archive step=preparation_deadline_reached check=%s elapsed_seconds=%s",
+                        check_count,
+                        int(now - preparation_started_at),
+                    )
                     await response.aclose()
                     raise RuntimeError(
                         "The archive was not ready before the configured wait limit."
@@ -522,8 +680,22 @@ class ArchiveClient:
                         next_check_seconds,
                     )
                 )
+                LOG.info(
+                    "archive step=preparation_progress_sent check=%s elapsed_seconds=%s next_check_seconds=%s",
+                    check_count,
+                    int(now - preparation_started_at),
+                    next_check_seconds,
+                )
                 await response.aclose()
+                LOG.info(
+                    "archive step=preparation_response_closed check=%s",
+                    check_count,
+                )
                 await asyncio.sleep(next_check_seconds)
+                LOG.info(
+                    "archive step=preparation_poll_start check=%s",
+                    check_count,
+                )
                 response = await self._submit_archive_request(
                     client, page_html, archiver_url, gallery_url
                 )
@@ -535,19 +707,37 @@ class ArchiveClient:
         current_method = method.upper()
         current_url = validate_outbound_url(url, self.settings.archive_download_hosts)
         current_kwargs = dict(kwargs)
+        LOG.info(
+            "http step=request_start method=%s location=%s",
+            current_method,
+            safe_url_for_log(current_url),
+        )
 
-        for _redirect in range(6):
+        for redirect_count in range(6):
             response = await self._send_with_retries(
                 client, current_method, current_url, current_kwargs
+            )
+            LOG.info(
+                "http step=response_received method=%s location=%s status=%s redirect_count=%s",
+                current_method,
+                safe_url_for_log(str(response.url)),
+                response.status_code,
+                redirect_count,
             )
             if response.status_code not in {301, 302, 303, 307, 308}:
                 return response
             location = response.headers.get("location")
             if not location:
+                LOG.warning("http step=redirect_missing_location status=%s", response.status_code)
                 return response
             next_url = validate_outbound_url(
                 urljoin(str(response.url), location),
                 self.settings.archive_download_hosts,
+            )
+            LOG.info(
+                "http step=redirect_follow status=%s next_location=%s",
+                response.status_code,
+                safe_url_for_log(next_url),
             )
             await response.aclose()
             if response.status_code == 303 or (
@@ -572,10 +762,24 @@ class ArchiveClient:
     ) -> httpx.Response:
         attempts = 3 if method in {"GET", "HEAD"} else 1
         for attempt in range(attempts):
+            LOG.info(
+                "http step=send_attempt method=%s location=%s attempt=%s max_attempts=%s",
+                method,
+                safe_url_for_log(url),
+                attempt + 1,
+                attempts,
+            )
             try:
                 request = client.build_request(method, url, **request_kwargs)
                 response = await client.send(request, stream=True)
-            except httpx.TransportError:
+            except httpx.TransportError as exc:
+                LOG.warning(
+                    "http step=transport_error method=%s location=%s attempt=%s error_type=%s",
+                    method,
+                    safe_url_for_log(url),
+                    attempt + 1,
+                    type(exc).__name__,
+                )
                 if attempt + 1 >= attempts:
                     raise
                 await asyncio.sleep(2**attempt)
@@ -587,6 +791,12 @@ class ArchiveClient:
             ):
                 return response
             delay = self._retry_delay(response, attempt)
+            LOG.warning(
+                "http step=retryable_response status=%s attempt=%s delay_seconds=%s",
+                response.status_code,
+                attempt + 1,
+                delay,
+            )
             await response.aclose()
             await asyncio.sleep(delay)
         raise AssertionError("retry loop exited unexpectedly")
@@ -602,6 +812,11 @@ class ArchiveClient:
     @staticmethod
     async def _read_html(response: httpx.Response) -> str:
         content_length = response.headers.get("content-length")
+        LOG.info(
+            "archive step=html_read_start location=%s declared_bytes=%s",
+            safe_url_for_log(str(response.url)),
+            content_length or "unknown",
+        )
         if content_length:
             try:
                 if int(content_length) > MAX_HTML_BYTES:
@@ -623,7 +838,14 @@ class ArchiveClient:
                     "The site returned an unexpectedly large HTML response."
                 )
         encoding = response.encoding or "utf-8"
-        return bytes(body).decode(encoding, errors="replace")
+        decoded = bytes(body).decode(encoding, errors="replace")
+        LOG.info(
+            "archive step=html_read_complete location=%s received_bytes=%s encoding=%s",
+            safe_url_for_log(str(response.url)),
+            len(body),
+            encoding,
+        )
+        return decoded
 
     async def _submit_archive_request(
         self,
@@ -632,6 +854,7 @@ class ArchiveClient:
         archiver_url: str,
         gallery_url: str,
     ) -> httpx.Response:
+        LOG.info("archive step=unlock_form_scan_start")
         soup = BeautifulSoup(page_html, "html.parser")
         form = None
         action = None
@@ -650,16 +873,23 @@ class ArchiveClient:
                 or any("password" in name for name in input_names)
             ):
                 login_form_found = True
+                LOG.info("archive step=login_form_skipped")
                 continue
             if parsed_action.path.lower().endswith("/archiver.php"):
                 form = candidate
                 action = candidate_action
+                LOG.info(
+                    "archive step=unlock_form_selected action=%s",
+                    safe_url_for_log(candidate_action),
+                )
                 break
         if not form:
             if login_form_found:
+                LOG.error("archive step=unlock_form_missing reason=login_form")
                 raise RuntimeError(
                     "The configured session is not logged in or has expired. Refresh EH_COOKIE."
                 )
+            LOG.error("archive step=unlock_form_missing reason=no_archive_form")
             raise RuntimeError(
                 "Could not find the archive form. Check that the account is eligible for archive downloads."
             )
@@ -672,6 +902,11 @@ class ArchiveClient:
             ),
         }
         action = validate_outbound_url(action, SUPPORTED_GALLERY_HOSTS)
+        LOG.info(
+            "archive step=unlock_submit method=POST action=%s archive_type=%s encoding=multipart",
+            safe_url_for_log(action),
+            self.settings.archive_type,
+        )
         return await self._request(
             client,
             "POST",
@@ -683,6 +918,11 @@ class ArchiveClient:
     @staticmethod
     def _raise_for_site_error(response: httpx.Response, response_html: str) -> None:
         parsed_url = urlparse(str(response.url))
+        LOG.info(
+            "archive step=site_error_check status=%s location=%s",
+            response.status_code,
+            safe_url_for_log(str(response.url)),
+        )
         if response.status_code in {401, 403} and (
             "act=login" in parsed_url.query.lower()
             or (
@@ -690,27 +930,33 @@ class ArchiveClient:
                 and parsed_url.path.lower().endswith("/index.php")
             )
         ):
+            LOG.error("archive step=site_error_detected category=expired_session")
             raise RuntimeError(
                 "The configured session is not logged in or has expired. Refresh EH_COOKIE."
             )
         response.raise_for_status()
         text = response_html.lower()
         if any(marker in text for marker in AUTH_FAILURE_MARKERS):
+            LOG.error("archive step=site_error_detected category=auth_marker")
             raise RuntimeError(
                 "The configured session is not logged in or has expired. Refresh EH_COOKIE."
             )
         if "sad panda" in text or (
             "exhentai.org" in str(response.url) and "restricted" in text
         ):
+            LOG.error("archive step=site_error_detected category=access_restricted")
             raise RuntimeError(
                 "This account cannot access ExHentai from the current network/session."
             )
         if "insufficient funds" in text or "insufficient gp" in text:
+            LOG.error("archive step=site_error_detected category=insufficient_funds")
             raise RuntimeError(
                 "The account does not have enough archive points for this download."
             )
+        LOG.info("archive step=site_error_check_passed")
 
     def _storage_budget(self) -> int:
+        LOG.info("archive step=storage_budget_calculation_start")
         existing_bytes = sum(
             entry.stat().st_size
             for entry in self.settings.download_dir.iterdir()
@@ -723,15 +969,28 @@ class ArchiveClient:
         )
         budget = min(self.settings.max_archive_bytes, quota_remaining, disk_remaining)
         if budget <= 0:
+            LOG.error(
+                "archive step=storage_budget_exhausted quota_remaining=%s disk_remaining=%s",
+                quota_remaining,
+                disk_remaining,
+            )
             raise RuntimeError(
                 "Download storage quota or minimum free-disk reserve has been reached."
             )
+        LOG.info(
+            "archive step=storage_budget_ready budget_bytes=%s quota_remaining=%s disk_remaining=%s",
+            budget,
+            quota_remaining,
+            disk_remaining,
+        )
         return budget
 
     def _unique_destination(self, filename: str, gid: str) -> Path:
         destination = self.settings.download_dir / filename
         if not destination.exists():
+            LOG.info("archive step=destination_available collision=false")
             return destination
+        LOG.warning("archive step=destination_collision collision=true")
         return (
             self.settings.download_dir
             / f"{destination.stem}-{gid}-{uuid4().hex[:8]}{destination.suffix}"
@@ -739,19 +998,26 @@ class ArchiveClient:
 
     def _commit_temporary(self, temporary: Path, filename: str, gid: str) -> Path:
         """Publish a complete file atomically without overwriting any path."""
+        LOG.info("archive step=atomic_commit_start")
         while True:
             destination = self._unique_destination(filename, gid)
             try:
                 os.link(temporary, destination)
             except FileExistsError:
+                LOG.warning("archive step=atomic_commit_collision retry=true")
                 continue
             temporary.unlink()
+            LOG.info("archive step=atomic_commit_complete")
             return destination
 
     async def _save_response(
         self, response: httpx.Response, gid: str, progress: ProgressCallback
     ) -> Path:
         temporary: Path | None = None
+        LOG.info(
+            "archive step=save_response_start location=%s",
+            safe_url_for_log(str(response.url)),
+        )
         try:
             budget = self._storage_budget()
             length_header = response.headers.get("content-length")
@@ -760,6 +1026,11 @@ class ArchiveClient:
                 try:
                     parsed_length = int(length_header)
                     if parsed_length > budget:
+                        LOG.error(
+                            "archive step=declared_size_rejected declared_bytes=%s budget_bytes=%s",
+                            parsed_length,
+                            budget,
+                        )
                         raise RuntimeError(
                             "The archive exceeds the configured storage limits and was not saved."
                         )
@@ -772,15 +1043,32 @@ class ArchiveClient:
 
             filename = filename_from_response(response, f"ehentai-{gid}.zip")
             temporary = self.settings.download_dir / f".{uuid4().hex}.part"
+            LOG.info(
+                "archive step=temporary_file_planned total_bytes=%s budget_bytes=%s",
+                total_bytes if total_bytes is not None else "unknown",
+                budget,
+            )
             written = 0
             last_reported_bytes = 0
             last_reported_percentage = 0
             last_progress_at = time.monotonic()
             await progress(download_progress_message(filename, 0, total_bytes))
+            LOG.info("archive step=download_progress_sent written_bytes=0")
             with temporary.open("xb") as file_handle:
+                LOG.info("archive step=temporary_file_opened")
                 async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                     written += len(chunk)
+                    LOG.info(
+                        "archive step=download_chunk_received chunk_bytes=%s written_bytes=%s",
+                        len(chunk),
+                        written,
+                    )
                     if written > budget:
+                        LOG.error(
+                            "archive step=stream_size_rejected written_bytes=%s budget_bytes=%s",
+                            written,
+                            budget,
+                        )
                         raise RuntimeError(
                             "The archive exceeded the configured storage limits; the partial file was removed."
                         )
@@ -805,8 +1093,15 @@ class ArchiveClient:
                         last_reported_bytes = written
                         last_reported_percentage = current_percentage or 0
                         last_progress_at = now
+                        LOG.info(
+                            "archive step=download_progress_sent written_bytes=%s percentage=%s",
+                            written,
+                            current_percentage if current_percentage is not None else "unknown",
+                        )
                 file_handle.flush()
+                LOG.info("archive step=temporary_file_flushed")
                 os.fsync(file_handle.fileno())
+                LOG.info("archive step=temporary_file_synced")
 
             if written != last_reported_bytes:
                 await progress(
@@ -816,9 +1111,14 @@ class ArchiveClient:
                 f"🔎 Download received: {filename}\n"
                 f"{format_bytes(written)} — validating archive…"
             )
+            LOG.info(
+                "archive step=archive_validation_start written_bytes=%s",
+                written,
+            )
 
             detected_suffix = archive_format(temporary)
             if detected_suffix is None:
+                LOG.error("archive step=archive_validation_failed reason=signature")
                 raise RuntimeError(
                     "The downloaded response was not a recognized ZIP, RAR, or 7z archive."
                 )
@@ -828,11 +1128,17 @@ class ArchiveClient:
                     filename = f"{Path(filename).stem}{detected_suffix}"
             else:
                 filename = f"{filename}{detected_suffix}"
+            LOG.info(
+                "archive step=archive_validation_passed detected_format=%s",
+                detected_suffix.removeprefix("."),
+            )
             return self._commit_temporary(temporary, filename, gid)
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+                LOG.info("archive step=temporary_cleanup_complete")
             await response.aclose()
+            LOG.info("archive step=download_response_closed")
 
 
 class BotService:
@@ -845,31 +1151,50 @@ class BotService:
         self.active_job: ArchiveJob | None = None
         self.worker_task: asyncio.Task[None] | None = None
         self.pending_downloads: dict[str, PendingDownload] = {}
+        LOG.info("bot step=service_initialized queue_capacity=%s", settings.queue_size)
 
     def authorized(self, update: Update) -> bool:
         user = update.effective_user
         chat = update.effective_chat
-        return (
+        authorized = (
             user is not None
             and user.id in self.settings.allowed_user_ids
             and chat is not None
             and chat.type == ChatType.PRIVATE
         )
+        LOG.info(
+            "bot step=authorization_checked authorized=%s user_present=%s chat_present=%s private_chat=%s",
+            authorized,
+            user is not None,
+            chat is not None,
+            chat is not None and chat.type == ChatType.PRIVATE,
+        )
+        return authorized
 
     async def post_init(self, application: Application) -> None:
+        LOG.info("bot step=post_init_start")
         self.worker_task = asyncio.create_task(self._worker(), name="archive-worker")
+        LOG.info("bot step=worker_task_created")
 
     async def post_shutdown(self, application: Application) -> None:
+        LOG.info("bot step=post_shutdown_start worker_present=%s", self.worker_task is not None)
         if self.worker_task is None:
             return
         self.worker_task.cancel()
+        LOG.info("bot step=worker_cancel_requested")
         with suppress(asyncio.CancelledError):
             await self.worker_task
+        LOG.info("bot step=post_shutdown_complete")
 
     async def _safe_edit(self, notice: Message, message: str) -> None:
+        LOG.info("telegram step=notice_edit_start message_chars=%s", len(message))
         for attempt in range(3):
             try:
                 await notice.edit_text(message, reply_markup=None)
+                LOG.info(
+                    "telegram step=notice_edit_complete attempt=%s",
+                    attempt + 1,
+                )
                 return
             except RetryAfter as exc:
                 retry_after = exc.retry_after
@@ -878,8 +1203,17 @@ class BotService:
                     if hasattr(retry_after, "total_seconds")
                     else float(retry_after)
                 )
+                LOG.warning(
+                    "telegram step=notice_edit_rate_limited attempt=%s delay_seconds=%s",
+                    attempt + 1,
+                    delay,
+                )
                 await asyncio.sleep(min(max(delay, 0.0), 30.0))
             except NetworkError:
+                LOG.warning(
+                    "telegram step=notice_edit_network_error attempt=%s",
+                    attempt + 1,
+                )
                 if attempt == 2:
                     LOG.exception("Could not update Telegram job notice")
                     return
@@ -893,12 +1227,19 @@ class BotService:
     async def _safe_answer(
         query: CallbackQuery, message: str | None = None, *, show_alert: bool = False
     ) -> None:
+        LOG.info(
+            "telegram step=callback_answer_start has_message=%s show_alert=%s",
+            message is not None,
+            show_alert,
+        )
         try:
             await query.answer(message, show_alert=show_alert)
+            LOG.info("telegram step=callback_answer_complete")
         except TelegramError:
             LOG.warning("Could not answer Telegram callback query", exc_info=True)
 
     def _prune_pending_downloads(self) -> None:
+        before = len(self.pending_downloads)
         cutoff = time.monotonic() - CONFIRMATION_TTL_SECONDS
         expired = [
             request_id
@@ -907,17 +1248,31 @@ class BotService:
         ]
         for request_id in expired:
             self.pending_downloads.pop(request_id, None)
+        LOG.info(
+            "bot step=pending_confirmations_pruned before=%s expired=%s remaining=%s",
+            before,
+            len(expired),
+            len(self.pending_downloads),
+        )
 
     async def _worker(self) -> None:
+        LOG.info("worker step=loop_started")
         while True:
+            LOG.info("worker step=waiting_for_job queued=%s", self.queue.qsize())
             job = await self.queue.get()
             self.active_job = job
+            LOG.info("worker step=job_started queued_remaining=%s", self.queue.qsize())
 
             async def progress(message: str, notice: Message = job.notice) -> None:
+                LOG.info("worker step=progress_callback message_chars=%s", len(message))
                 await self._safe_edit(notice, message)
 
             try:
                 archive = await self.client.download(job.url, progress)
+                LOG.info(
+                    "worker step=archive_download_complete size_bytes=%s",
+                    archive.stat().st_size,
+                )
                 await self._safe_edit(
                     job.notice,
                     f"✅ Download completed successfully\n"
@@ -926,15 +1281,20 @@ class BotService:
                     f"Saved to: {archive.parent}",
                 )
             except asyncio.CancelledError:
+                LOG.warning("worker step=job_cancelled")
                 await self._safe_edit(
                     job.notice, "Download interrupted because the bot is stopping."
                 )
                 raise
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
-                LOG.warning("Download failed for user %s: %s", job.user_id, exc)
+                LOG.warning(
+                    "worker step=job_failed error_type=%s error=%s",
+                    type(exc).__name__,
+                    exc,
+                )
                 await self._safe_edit(job.notice, f"❌ Download failed\n{exc}")
             except Exception:
-                LOG.exception("Unexpected download failure for user %s", job.user_id)
+                LOG.exception("worker step=job_failed_unexpected")
                 await self._safe_edit(
                     job.notice,
                     "❌ Download failed unexpectedly\nCheck the bot logs for details.",
@@ -942,9 +1302,15 @@ class BotService:
             finally:
                 self.active_job = None
                 self.queue.task_done()
+                LOG.info(
+                    "worker step=job_finalized queued=%s",
+                    self.queue.qsize(),
+                )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        LOG.info("bot step=start_command_received")
         if not self.authorized(update):
+            LOG.info("bot step=start_command_ignored reason=unauthorized")
             return
         await update.effective_message.reply_text(
             "Send or forward an E-Hentai or ExHentai gallery URL.\n"
@@ -953,14 +1319,18 @@ class BotService:
         )
 
     async def whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        LOG.info("bot step=whoami_command_received")
         if not self.authorized(update):
+            LOG.info("bot step=whoami_command_ignored reason=unauthorized")
             return
         await update.effective_message.reply_text(
             f"Your Telegram user ID: {update.effective_user.id}"
         )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        LOG.info("bot step=status_command_received")
         if not self.authorized(update):
+            LOG.info("bot step=status_command_ignored reason=unauthorized")
             return
         cookie_state = "configured" if self.settings.cookie_header else "missing"
         active_state = "active" if self.active_job else "idle"
@@ -975,20 +1345,28 @@ class BotService:
     async def gallery_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        LOG.info("bot step=gallery_message_received")
         if not self.authorized(update):
+            LOG.info("bot step=gallery_message_ignored reason=unauthorized")
             return
         message = update.effective_message
         text = message.text or message.caption or ""
         gallery_url = extract_gallery_url(text)
         if gallery_url is None:
+            LOG.info("bot step=gallery_message_rejected reason=no_valid_url")
             await message.reply_text(
                 "I couldn’t find a valid E-Hentai or ExHentai gallery URL in that message."
             )
             return
 
+        LOG.info(
+            "bot step=gallery_url_accepted host=%s",
+            urlparse(gallery_url).hostname,
+        )
         await message.reply_chat_action(ChatAction.TYPING)
         self._prune_pending_downloads()
         if len(self.pending_downloads) >= self.settings.queue_size:
+            LOG.warning("bot step=confirmation_rejected reason=capacity")
             await message.reply_text(
                 "There are too many requests awaiting confirmation. Respond to an existing prompt first."
             )
@@ -1022,26 +1400,35 @@ class BotService:
             user_id=update.effective_user.id,
             created_at=time.monotonic(),
         )
+        LOG.info(
+            "bot step=confirmation_created pending=%s",
+            len(self.pending_downloads),
+        )
 
     async def confirm_download(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
+        LOG.info("bot step=confirmation_callback_received")
         if not self.authorized(update) or update.callback_query is None:
+            LOG.info("bot step=confirmation_callback_ignored reason=unauthorized_or_missing")
             return
         query = update.callback_query
         data = query.data or ""
         try:
             _prefix, action, request_id = data.split(":", 2)
         except ValueError:
+            LOG.warning("bot step=confirmation_rejected reason=malformed_callback")
             await self._safe_answer(query, "Invalid download request.", show_alert=True)
             return
         if action not in {"confirm", "cancel"}:
+            LOG.warning("bot step=confirmation_rejected reason=invalid_action")
             await self._safe_answer(query, "Invalid download request.", show_alert=True)
             return
 
         self._prune_pending_downloads()
         pending = self.pending_downloads.get(request_id)
         if pending is None:
+            LOG.info("bot step=confirmation_rejected reason=expired")
             await self._safe_answer(
                 query, "This confirmation has expired.", show_alert=True
             )
@@ -1051,6 +1438,7 @@ class BotService:
                 )
             return
         if pending.user_id != update.effective_user.id:
+            LOG.warning("bot step=confirmation_rejected reason=wrong_user")
             await self._safe_answer(
                 query, "This confirmation belongs to another user.", show_alert=True
             )
@@ -1059,8 +1447,10 @@ class BotService:
         self.pending_downloads.pop(request_id, None)
         await self._safe_answer(query)
         if query.message is None:
+            LOG.warning("bot step=confirmation_stopped reason=missing_message")
             return
         if action == "cancel":
+            LOG.info("bot step=confirmation_cancelled")
             await self._safe_edit(query.message, "Download cancelled.")
             return
 
@@ -1074,10 +1464,16 @@ class BotService:
                 )
             )
         except asyncio.QueueFull:
+            LOG.warning("bot step=queue_rejected reason=full")
             await self._safe_edit(
                 query.message, "The download queue is full; try again later."
             )
             return
+        LOG.info(
+            "bot step=job_queued position=%s queued=%s",
+            queue_position,
+            self.queue.qsize(),
+        )
         await self._safe_edit(
             query.message, f"⏳ Confirmed and queued at position {queue_position}."
         )
@@ -1086,7 +1482,11 @@ class BotService:
 def main() -> None:
     settings = Settings.from_env()
     configure_logging(settings)
+    LOG.info("startup step=settings_loaded")
+    enable_function_call_logging()
+    LOG.info("startup step=service_construction_start")
     service = BotService(settings)
+    LOG.info("startup step=telegram_application_build_start")
     app = (
         Application.builder()
         .token(settings.token)
@@ -1095,6 +1495,7 @@ def main() -> None:
         .post_shutdown(service.post_shutdown)
         .build()
     )
+    LOG.info("startup step=telegram_application_built")
     app.add_handler(CommandHandler("start", service.start))
     app.add_handler(CommandHandler("whoami", service.whoami))
     app.add_handler(CommandHandler("status", service.status))
@@ -1109,7 +1510,9 @@ def main() -> None:
             (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, service.gallery_message
         )
     )
+    LOG.info("startup step=handlers_registered")
     LOG.info("Bot starting; destination is %s", settings.download_dir)
+    LOG.info("startup step=polling_start")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

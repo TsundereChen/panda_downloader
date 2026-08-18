@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,15 +17,18 @@ from bot import (
     BotService,
     SecretRedactingFormatter,
     Settings,
+    archive_html_state,
     archive_link_from_html,
     archive_preparation_progress_message,
     download_progress_message,
+    enable_function_call_logging,
     extract_gallery_url,
     filename_from_response,
     format_bytes,
     normalize_cookie_header,
     parse_cookie_header,
     parse_gallery_url,
+    safe_url_for_log,
 )
 from eh_web_login import CookieCollector, cookie_header, is_ready, parse_cookie_string
 
@@ -131,6 +136,54 @@ def test_log_formatter_redacts_bot_token_and_cookie_values():
     assert "123456:telegram-secret" not in rendered
     assert "cookie-secret" not in rendered
     assert rendered.count("<redacted>") == 2
+
+
+def test_logging_helpers_do_not_expose_url_queries_or_html_content():
+    formatter = SecretRedactingFormatter("%(message)s", ())
+    record = logging.LogRecord(
+        name="bot",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="GET https://e-hentai.org/archiver.php?gid=12&token=secret-token",
+        args=(),
+        exc_info=None,
+    )
+
+    assert formatter.format(record) == (
+        "GET https://e-hentai.org/archiver.php?<redacted-query>"
+    )
+    assert safe_url_for_log(
+        "https://user:password@e-hentai.org/archiver.php?token=secret#fragment"
+    ) == "https://e-hentai.org/archiver.php"
+
+    state = archive_html_state(
+        '<form><input name="dltype"><input name="dlcheck" value="secret-token">'
+        '</form><div id="continue"><a href="?token=secret-token">Next</a></div>'
+    )
+    assert "forms=1" in state
+    assert "dltype_field=True" in state
+    assert "dlcheck_field=True" in state
+    assert "continue_link=True" in state
+    assert "secret-token" not in state
+
+
+def test_function_call_logging_records_names_without_values(caplog, monkeypatch):
+    previous_profile = sys.getprofile()
+    previous_thread_profile = threading.getprofile()
+    monkeypatch.setenv("FUNCTION_TRACE_LOGGING", "true")
+    caplog.set_level(logging.INFO, logger="bot")
+
+    try:
+        enable_function_call_logging()
+        assert format_bytes(1024) == "1.0 KiB"
+    finally:
+        sys.setprofile(previous_profile)
+        threading.setprofile(previous_thread_profile)
+
+    assert "function event=call name=format_bytes" in caplog.text
+    assert "function event=return name=format_bytes" in caplog.text
+    assert "1024" not in caplog.text
 
 
 def test_completed_link_is_resolved_and_external_link_is_rejected():
@@ -443,7 +496,9 @@ def test_archive_preparation_reports_every_status_check(monkeypatch, tmp_path):
     assert any("stage 2/2" in message for message in messages)
 
 
-def test_archive_client_follows_jhentai_official_flow(monkeypatch, tmp_path):
+def test_archive_client_follows_jhentai_official_flow(
+    caplog, monkeypatch, tmp_path
+):
     calls = []
     archive_posts = 0
     archive_bytes = b"PK\x03\x04archive"
@@ -489,6 +544,7 @@ def test_archive_client_follows_jhentai_official_flow(monkeypatch, tmp_path):
         return None
 
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    caplog.set_level(logging.INFO, logger="bot")
     client = ArchiveClient(
         make_settings(tmp_path), transport=httpx.MockTransport(handler)
     )
@@ -505,6 +561,13 @@ def test_archive_client_follows_jhentai_official_flow(monkeypatch, tmp_path):
         ("GET", "/download-page"),
         ("GET", "/archive/12"),
     ]
+    log_output = caplog.text
+    assert "archive step=initial_archiver_html_read" in log_output
+    assert "archive step=preparation_poll_start check=1" in log_output
+    assert "archive step=next_link_found" in log_output
+    assert "archive step=stage_2_entered" in log_output
+    assert "archive step=archive_validation_passed" in log_output
+    assert "token=abc" not in log_output
 
 
 def test_exhentai_download_requires_igneous_before_network_access(tmp_path):
