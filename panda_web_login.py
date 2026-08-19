@@ -13,12 +13,14 @@ import sys
 import threading
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import set_key
 
 EH_HOME_URL = "https://e-hentai.org/"
 EX_HOME_URL = "https://exhentai.org/"
 COOKIE_NAMES = ("ipb_member_id", "ipb_pass_hash", "igneous")
+TRUSTED_LOGIN_HOSTS = frozenset({"e-hentai.org", "exhentai.org"})
 
 
 def parse_cookie_string(cookie_string: str) -> dict[str, str]:
@@ -44,6 +46,35 @@ def is_ready(cookies: dict[str, str], require_exhentai: bool) -> bool:
     return required <= cookies.keys()
 
 
+def is_trusted_login_url(url: str | None) -> bool:
+    try:
+        parsed = urlparse(url or "")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return False
+    return (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower().rstrip(".") in TRUSTED_LOGIN_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port in {None, 443}
+    )
+
+
+def webview_cookie_values(cookie_jars: Iterable[object]) -> dict[str, str]:
+    """Extract required values from pywebview's SimpleCookie results."""
+    result: dict[str, str] = {}
+    for cookie_jar in cookie_jars:
+        items = getattr(cookie_jar, "items", None)
+        if not callable(items):
+            continue
+        for name, morsel in items():
+            value = getattr(morsel, "value", "")
+            if name in COOKIE_NAMES and value:
+                result[name] = value
+    return result
+
+
 class CookieCollector:
     def __init__(self, output_path: Path, require_exhentai: bool) -> None:
         self.cookies: dict[str, str] = {}
@@ -53,7 +84,7 @@ class CookieCollector:
         self._save_lock = threading.Lock()
 
     def capture(self, cookie_string: str) -> bool:
-        """Called from the WebView; returns whether all required fields exist."""
+        """Collect trusted native WebView cookies and report account readiness."""
         self.cookies.update(parse_cookie_string(cookie_string))
         if is_ready(self.cookies, require_exhentai=self.require_exhentai):
             self._save()
@@ -117,39 +148,20 @@ def main(argv: Iterable[str] | None = None) -> int:
     window = webview.create_window(
         "E-Hentai session setup",
         EH_HOME_URL,
-        js_api=collector,
         width=1050,
         height=780,
     )
 
-    def inject_cookie_capture() -> None:
-        # The call is local (WebView → this process). It does not send cookies to
-        # any third party. Reinstall after navigation, so visiting exhentai.org
-        # captures igneous as well.
-        window.run_js(
-            """
-            (() => {
-              const exHome = "https://exhentai.org/";
-              const send = () => {
-                if (window.pywebview?.api?.capture) {
-                  window.pywebview.api.capture(document.cookie).then((hasAccountCookies) => {
-                    const onEhFamily = location.hostname === "e-hentai.org" || location.hostname.endsWith(".e-hentai.org");
-                    if (hasAccountCookies && onEhFamily) {
-                      // A WebView has no address bar. Once the user has
-                      // completed the normal E-Hentai sign-in, continue to
-                      // ExHentai automatically to acquire igneous.
-                      location.assign(exHome);
-                    }
-                  }).catch(() => {});
-                }
-              };
-              send();
-              window.setInterval(send, 1500);
-            })();
-            """
-        )
+    def collect_current_page_cookies() -> None:
+        current_url = window.get_current_url()
+        if not is_trusted_login_url(current_url):
+            return
+        cookies = webview_cookie_values(window.get_cookies())
+        has_account_cookies = collector.capture(cookie_header(cookies))
+        if has_account_cookies and urlparse(current_url).hostname == "e-hentai.org":
+            window.load_url(EX_HOME_URL)
 
-    window.events.loaded += inject_cookie_capture
+    window.events.loaded += collect_current_page_cookies
     print("Complete the site verification and sign in in the displayed window.")
     print(
         f"The window starts on {EH_HOME_URL} and automatically opens {EX_HOME_URL} after E-Hentai sign-in."

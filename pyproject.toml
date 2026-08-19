@@ -3,6 +3,7 @@ name = "panda_downloader"
 version = "0.1.0"
 description = "Private Telegram bot for E-Hentai and ExHentai archive downloads"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12,<5.0",

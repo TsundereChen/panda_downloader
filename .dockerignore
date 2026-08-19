@@ -1,5 +1,9 @@
-.env
+.env*
 test_cred
+*.key
+*.pem
+*.p12
+*.pfx
 .git
 .github
 .venv

@@ -6,7 +6,7 @@ services:
     environment:
       DOWNLOAD_DIR: /downloads
     volumes:
-      - ./downloads:/downloads
+      - downloads:/downloads
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -16,3 +16,6 @@ services:
       - no-new-privileges:true
     init: true
     restart: unless-stopped
+
+volumes:
+  downloads:

@@ -16,6 +16,7 @@ import shutil
 import sys
 import threading
 import time
+import zipfile
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, replace
@@ -75,12 +76,11 @@ MAX_TELEGRAM_CAPTION_CHARS: Final = 1024
 CONFIRMATION_TTL_SECONDS: Final = 10 * 60
 PROGRESS_UPDATE_SECONDS: Final = 2.0
 ARCHIVE_POLL_SECONDS: Final = 5
+MAX_ARCHIVE_LINK_TRANSITIONS: Final = 10
 ARCHIVE_SIGNATURES: Final = (
     (b"PK\x03\x04", ".zip"),
     (b"PK\x05\x06", ".zip"),
     (b"PK\x07\x08", ".zip"),
-    (b"Rar!\x1a\x07", ".rar"),
-    (b"7z\xbc\xaf\x27\x1c", ".7z"),
 )
 ProgressCallback = Callable[[str], Awaitable[None]]
 
@@ -460,7 +460,7 @@ def archive_link_from_html(
     soup = BeautifulSoup(html, "html.parser")
 
     # The official flow first returns a continuation page, then a download page.
-    # Match the same elements as JHentai before falling back to text heuristics.
+    # Match its specific elements before falling back to text heuristics.
     for selector, is_download_link in (
         ("#continue > a[href]", False),
         ("#db > p > a[href]", True),
@@ -524,6 +524,28 @@ def archive_format(path: Path) -> str | None:
         if header.startswith(signature):
             return suffix
     return None
+
+
+def validate_archive(path: Path, max_uncompressed_bytes: int) -> str:
+    """Return the archive suffix after bounded structural validation."""
+    detected_suffix = archive_format(path)
+    if detected_suffix is None:
+        raise RuntimeError("The downloaded response was not a recognized ZIP archive.")
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            if sum(entry.file_size for entry in archive.infolist()) > max_uncompressed_bytes:
+                raise RuntimeError(
+                    "The ZIP archive expands beyond the configured archive size limit."
+                )
+            corrupt_entry = archive.testzip()
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        if isinstance(exc, RuntimeError) and str(exc).startswith("The ZIP archive"):
+            raise
+        raise RuntimeError("The downloaded ZIP archive is corrupt or truncated.") from exc
+    if corrupt_entry is not None:
+        raise RuntimeError("The downloaded ZIP archive failed its integrity check.")
+    return detected_suffix
 
 
 def format_bytes(byte_count: int) -> str:
@@ -731,9 +753,8 @@ class ArchiveClient:
                     await image_response.aclose()
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 LOG.warning(
-                    "gallery_preview step=image_fetch_failed error_type=%s error=%s",
+                    "gallery_preview step=image_fetch_failed error_type=%s",
                     type(exc).__name__,
-                    exc,
                 )
                 return preview
 
@@ -773,7 +794,7 @@ class ArchiveClient:
         LOG.info("archive step=session_configuration_validated host=%s", host)
         gallery_url = f"https://{host}/g/{gid}/{gallery_token}/"
         archiver_url = f"https://{host}/archiver.php?gid={gid}&token={gallery_token}"
-        self.settings.download_dir.mkdir(parents=True, exist_ok=True)
+        self.settings.download_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         LOG.info("archive step=download_directory_ready")
 
         async with self._client() as client:
@@ -795,6 +816,7 @@ class ArchiveClient:
             preparation_started_at = time.monotonic()
             deadline = preparation_started_at + self.settings.wait_seconds
             check_count = 0
+            seen_links = {urlunparse(urlparse(str(response.url))._replace(fragment=""))}
             LOG.info(
                 "archive step=preparation_started wait_seconds=%s poll_seconds=%s",
                 self.settings.wait_seconds,
@@ -802,6 +824,17 @@ class ArchiveClient:
             )
 
             while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    LOG.error(
+                        "archive step=preparation_deadline_reached check=%s elapsed_seconds=%s",
+                        check_count,
+                        int(now - preparation_started_at),
+                    )
+                    await response.aclose()
+                    raise RuntimeError(
+                        "The archive was not ready before the configured wait limit."
+                    )
                 log_response_step(
                     "preparation_response_received",
                     response,
@@ -814,7 +847,9 @@ class ArchiveClient:
                     )
                     return await self._save_response(response, gid, progress)
 
-                response_html = await self._read_html(response)
+                response_html = await self._read_html_before_deadline(
+                    response, deadline
+                )
                 log_response_step(
                     "preparation_html_read",
                     response,
@@ -832,6 +867,27 @@ class ArchiveClient:
                     self.settings.archive_download_hosts,
                 )
                 if link:
+                    normalized_link = urlunparse(urlparse(link)._replace(fragment=""))
+                    if (
+                        normalized_link in seen_links
+                        or len(seen_links) >= MAX_ARCHIVE_LINK_TRANSITIONS
+                    ):
+                        LOG.error(
+                            "archive step=link_cycle_rejected check=%s transitions=%s",
+                            check_count,
+                            len(seen_links),
+                        )
+                        await response.aclose()
+                        raise RuntimeError(
+                            "The site returned a repeated or excessive archive link chain."
+                        )
+                    now = time.monotonic()
+                    if now >= deadline:
+                        await response.aclose()
+                        raise RuntimeError(
+                            "The archive was not ready before the configured wait limit."
+                        )
+                    seen_links.add(normalized_link)
                     LOG.info(
                         "archive step=next_link_found check=%s location=%s",
                         check_count,
@@ -843,10 +899,11 @@ class ArchiveClient:
                         "archive step=preparation_response_closed check=%s",
                         check_count,
                     )
-                    response = await self._request(
+                    response = await self._request_before_deadline(
                         client,
                         "GET",
                         link,
+                        deadline,
                         headers={"Referer": referer},
                     )
                     continue
@@ -890,8 +947,47 @@ class ArchiveClient:
                     check_count,
                 )
                 response = await self._submit_archive_request(
-                    client, page_html, archiver_url, gallery_url
+                    client, page_html, archiver_url, gallery_url, deadline=deadline
                 )
+
+    async def _read_html_before_deadline(
+        self, response: httpx.Response, deadline: float
+    ) -> str:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            await response.aclose()
+            raise RuntimeError(
+                "The archive was not ready before the configured wait limit."
+            )
+        try:
+            async with asyncio.timeout(remaining):
+                return await self._read_html(response)
+        except TimeoutError as exc:
+            await response.aclose()
+            raise RuntimeError(
+                "The archive was not ready before the configured wait limit."
+            ) from exc
+
+    async def _request_before_deadline(
+        self,
+        client: httpx.AsyncClient,
+        method: str,
+        url: str,
+        deadline: float,
+        **kwargs,
+    ) -> httpx.Response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "The archive was not ready before the configured wait limit."
+            )
+        try:
+            async with asyncio.timeout(remaining):
+                return await self._request(client, method, url, **kwargs)
+        except TimeoutError as exc:
+            raise RuntimeError(
+                "The archive was not ready before the configured wait limit."
+            ) from exc
 
     async def _request(
         self,
@@ -1053,6 +1149,8 @@ class ArchiveClient:
         page_html: str,
         archiver_url: str,
         gallery_url: str,
+        *,
+        deadline: float | None = None,
     ) -> httpx.Response:
         LOG.info("archive step=unlock_form_scan_start")
         soup = BeautifulSoup(page_html, "html.parser")
@@ -1107,13 +1205,15 @@ class ArchiveClient:
             safe_url_for_log(action),
             self.settings.archive_type,
         )
-        return await self._request(
-            client,
-            "POST",
-            action,
-            files={name: (None, value) for name, value in data.items()},
-            headers={"Referer": gallery_url},
-        )
+        request_kwargs = {
+            "files": {name: (None, value) for name, value in data.items()},
+            "headers": {"Referer": gallery_url},
+        }
+        if deadline is not None:
+            return await self._request_before_deadline(
+                client, "POST", action, deadline, **request_kwargs
+            )
+        return await self._request(client, "POST", action, **request_kwargs)
 
     @staticmethod
     def _raise_for_site_error(response: httpx.Response, response_html: str) -> None:
@@ -1254,7 +1354,12 @@ class ArchiveClient:
             last_progress_at = time.monotonic()
             await progress(download_progress_message(filename, 0, total_bytes))
             LOG.info("archive step=download_progress_sent written_bytes=0")
-            with temporary.open("xb") as file_handle:
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as file_handle:
                 LOG.info("archive step=temporary_file_opened")
                 async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
                     written += len(chunk)
@@ -1303,6 +1408,16 @@ class ArchiveClient:
                 os.fsync(file_handle.fileno())
                 LOG.info("archive step=temporary_file_synced")
 
+            if total_bytes is not None and written != total_bytes:
+                LOG.error(
+                    "archive step=declared_size_mismatch declared_bytes=%s written_bytes=%s",
+                    total_bytes,
+                    written,
+                )
+                raise RuntimeError(
+                    "The archive download was truncated before the declared size was received."
+                )
+
             if written != last_reported_bytes:
                 await progress(
                     download_progress_message(filename, written, total_bytes)
@@ -1316,14 +1431,15 @@ class ArchiveClient:
                 written,
             )
 
-            detected_suffix = archive_format(temporary)
-            if detected_suffix is None:
-                LOG.error("archive step=archive_validation_failed reason=signature")
-                raise RuntimeError(
-                    "The downloaded response was not a recognized ZIP, RAR, or 7z archive."
+            try:
+                detected_suffix = validate_archive(
+                    temporary, self.settings.max_archive_bytes
                 )
+            except RuntimeError:
+                LOG.error("archive step=archive_validation_failed")
+                raise
             declared_suffix = Path(filename).suffix.lower()
-            if declared_suffix in {".zip", ".rar", ".7z"}:
+            if declared_suffix == ".zip":
                 if declared_suffix != detected_suffix:
                     filename = f"{Path(filename).stem}{detected_suffix}"
             else:
@@ -1492,11 +1608,15 @@ class BotService:
                 raise
             except (httpx.HTTPError, RuntimeError, ValueError) as exc:
                 LOG.warning(
-                    "worker step=job_failed error_type=%s error=%s",
+                    "worker step=job_failed error_type=%s",
                     type(exc).__name__,
-                    exc,
                 )
-                await self._safe_edit(job.notice, f"❌ Download failed\n{exc}")
+                detail = (
+                    "A network error occurred while contacting the archive service."
+                    if isinstance(exc, httpx.HTTPError)
+                    else str(exc)
+                )
+                await self._safe_edit(job.notice, f"❌ Download failed\n{detail}")
             except Exception:
                 LOG.exception("worker step=job_failed_unexpected")
                 await self._safe_edit(
@@ -1603,9 +1723,8 @@ class BotService:
             )
         except (httpx.HTTPError, RuntimeError, ValueError) as exc:
             LOG.warning(
-                "bot step=gallery_preview_failed error_type=%s error=%s",
+                "bot step=gallery_preview_failed error_type=%s",
                 type(exc).__name__,
-                exc,
             )
             preview = GalleryPreview(
                 gallery_name="Unavailable",

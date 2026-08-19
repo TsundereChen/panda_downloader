@@ -1,8 +1,12 @@
 import asyncio
+import io
 import logging
 import os
 import sys
 import threading
+import time
+import zipfile
+from http.cookies import SimpleCookie
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -33,7 +37,14 @@ from bot import (
     parse_gallery_url,
     safe_url_for_log,
 )
-from eh_web_login import CookieCollector, cookie_header, is_ready, parse_cookie_string
+from panda_web_login import (
+    CookieCollector,
+    cookie_header,
+    is_ready,
+    is_trusted_login_url,
+    parse_cookie_string,
+    webview_cookie_values,
+)
 
 
 def make_settings(tmp_path: Path, **overrides) -> Settings:
@@ -52,6 +63,15 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)
+
+
+def make_zip_bytes(content: bytes = b"archive-data") -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        entry = zipfile.ZipInfo("gallery.txt", date_time=(2020, 1, 1, 0, 0, 0))
+        entry.compress_type = zipfile.ZIP_DEFLATED
+        archive.writestr(entry, content)
+    return output.getvalue()
 
 
 def fake_update(user_id: int, chat_type: str = ChatType.PRIVATE):
@@ -496,7 +516,7 @@ def test_archive_preparation_progress_formatting():
 
 def test_archive_client_complete_flow(tmp_path):
     calls = []
-    archive_bytes = b"PK\x03\x04" + b"archive-data"
+    archive_bytes = make_zip_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append((request.method, request.url.path))
@@ -542,7 +562,7 @@ def test_archive_client_complete_flow(tmp_path):
 
 def test_archive_preparation_reports_every_status_check(monkeypatch, tmp_path):
     archive_posts = 0
-    archive_bytes = b"PK\x03\x04archive"
+    archive_bytes = make_zip_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal archive_posts
@@ -595,12 +615,12 @@ def test_archive_preparation_reports_every_status_check(monkeypatch, tmp_path):
     assert any("stage 2/2" in message for message in messages)
 
 
-def test_archive_client_follows_jhentai_official_flow(
+def test_archive_client_follows_official_flow(
     caplog, monkeypatch, tmp_path
 ):
     calls = []
     archive_posts = 0
-    archive_bytes = b"PK\x03\x04archive"
+    archive_bytes = make_zip_bytes()
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal archive_posts
@@ -667,6 +687,33 @@ def test_archive_client_follows_jhentai_official_flow(
     assert "archive step=stage_2_entered" in log_output
     assert "archive step=archive_validation_passed" in log_output
     assert "token=abc" not in log_output
+
+
+def test_archive_client_rejects_repeated_link_chain(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/archiver.php":
+            return httpx.Response(200, text='<form action="/archiver.php"></form>')
+        if request.method == "POST":
+            return httpx.Response(
+                200,
+                text='<div id="continue"><a href="/loop">Continue</a></div>',
+            )
+        if request.url.path == "/loop":
+            return httpx.Response(
+                200,
+                text='<div id="continue"><a href="/loop">Continue</a></div>',
+            )
+        raise AssertionError(f"unexpected request: {request}")
+
+    client = ArchiveClient(
+        make_settings(tmp_path, wait_seconds=60),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(RuntimeError, match="repeated or excessive"):
+        asyncio.run(
+            client.download("https://e-hentai.org/g/12/abcdef/", AsyncMock())
+        )
 
 
 def test_exhentai_download_requires_igneous_before_network_access(tmp_path):
@@ -770,6 +817,50 @@ def test_transient_get_failures_are_retried(monkeypatch, tmp_path):
     assert attempts == 3
 
 
+def test_archive_request_is_cancelled_at_preparation_deadline(tmp_path):
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, text="late")
+
+    client = ArchiveClient(
+        make_settings(tmp_path), transport=httpx.MockTransport(handler)
+    )
+
+    async def request():
+        async with client._client() as http_client:
+            await client._request_before_deadline(
+                http_client,
+                "GET",
+                "https://e-hentai.org/archiver.php",
+                time.monotonic() + 0.001,
+            )
+
+    with pytest.raises(RuntimeError, match="configured wait limit"):
+        asyncio.run(request())
+
+
+def test_archive_html_body_is_cancelled_at_preparation_deadline(tmp_path):
+    class SlowStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            await asyncio.sleep(0.05)
+            yield b"late"
+
+    client = ArchiveClient(make_settings(tmp_path))
+    response = httpx.Response(
+        200,
+        request=httpx.Request("GET", "https://e-hentai.org/archiver.php"),
+        stream=SlowStream(),
+    )
+
+    with pytest.raises(RuntimeError, match="configured wait limit"):
+        asyncio.run(
+            client._read_html_before_deadline(
+                response, time.monotonic() + 0.001
+            )
+        )
+    assert response.is_closed
+
+
 def test_invalid_archive_is_removed(tmp_path):
     settings = make_settings(tmp_path)
     client = ArchiveClient(settings)
@@ -781,6 +872,38 @@ def test_invalid_archive_is_removed(tmp_path):
     )
 
     with pytest.raises(RuntimeError, match="not a recognized"):
+        asyncio.run(client._save_response(response, "12", AsyncMock()))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_corrupt_zip_is_removed(tmp_path):
+    client = ArchiveClient(make_settings(tmp_path))
+    response = httpx.Response(
+        200,
+        request=httpx.Request("GET", "https://e-hentai.org/file"),
+        content=b"PK\x03\x04not-a-complete-zip",
+        headers={"content-type": "application/zip"},
+    )
+
+    with pytest.raises(RuntimeError, match="corrupt or truncated"):
+        asyncio.run(client._save_response(response, "12", AsyncMock()))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_short_response_is_rejected_when_content_length_is_declared(tmp_path):
+    archive_bytes = make_zip_bytes()
+    client = ArchiveClient(make_settings(tmp_path))
+    response = httpx.Response(
+        200,
+        request=httpx.Request("GET", "https://e-hentai.org/file"),
+        content=archive_bytes,
+        headers={
+            "content-type": "application/zip",
+            "content-length": str(len(archive_bytes) + 10),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="truncated"):
         asyncio.run(client._save_response(response, "12", AsyncMock()))
     assert list(tmp_path.iterdir()) == []
 
@@ -831,11 +954,12 @@ def test_interrupted_stream_removes_partial_file(tmp_path):
 def test_completed_archive_never_overwrites_existing_file(tmp_path):
     existing = tmp_path / "gallery.zip"
     existing.write_bytes(b"original")
+    archive_bytes = make_zip_bytes(b"new")
     client = ArchiveClient(make_settings(tmp_path))
     response = httpx.Response(
         200,
         request=httpx.Request("GET", "https://e-hentai.org/file"),
-        content=b"PK\x03\x04new",
+        content=archive_bytes,
         headers={
             "content-type": "application/zip",
             "content-disposition": 'attachment; filename="gallery.zip"',
@@ -845,7 +969,8 @@ def test_completed_archive_never_overwrites_existing_file(tmp_path):
     destination = asyncio.run(client._save_response(response, "12", AsyncMock()))
     assert existing.read_bytes() == b"original"
     assert destination != existing
-    assert destination.read_bytes() == b"PK\x03\x04new"
+    assert destination.read_bytes() == archive_bytes
+    assert destination.stat().st_mode & 0o777 == 0o600
 
 
 def test_total_storage_quota_is_enforced(tmp_path):
@@ -873,6 +998,27 @@ def test_web_login_cookie_collection_and_file_permissions(tmp_path):
     )
     assert is_ready(cookies, require_exhentai=True)
     assert os.stat(output).st_mode & 0o777 == 0o600
+
+
+def test_web_login_accepts_only_exact_trusted_https_origins():
+    assert is_trusted_login_url("https://e-hentai.org/")
+    assert is_trusted_login_url("https://exhentai.org/")
+    assert not is_trusted_login_url("https://attacker.example/")
+    assert not is_trusted_login_url("https://subdomain.e-hentai.org/")
+    assert not is_trusted_login_url("http://e-hentai.org/")
+
+
+def test_web_login_extracts_native_webview_cookie_values():
+    assert webview_cookie_values(
+        [
+            SimpleCookie("ipb_member_id=123; Path=/"),
+            SimpleCookie("ignored=no; ipb_pass_hash=hash; igneous=gate"),
+        ]
+    ) == {
+        "ipb_member_id": "123",
+        "ipb_pass_hash": "hash",
+        "igneous": "gate",
+    }
 
 
 def test_web_login_requires_igneous_for_exhentai():
@@ -931,3 +1077,36 @@ def test_worker_reports_failed_download(tmp_path):
     final_message = notice.edit_text.await_args.args[0]
     assert final_message.startswith("❌ Download failed")
     assert "site rejected" in final_message
+
+
+def test_worker_does_not_expose_http_error_url(caplog, tmp_path):
+    secret_url = "https://archive.example/archive/path-secret?token=query-secret"
+
+    class FailingClient:
+        async def download(self, url, progress):
+            request = httpx.Request("GET", secret_url)
+            response = httpx.Response(500, request=request)
+            response.raise_for_status()
+
+    async def scenario():
+        service = BotService(make_settings(tmp_path), client=FailingClient())
+        notice = AsyncMock()
+        worker = asyncio.create_task(service._worker())
+        await service.queue.put(
+            ArchiveJob("https://e-hentai.org/g/12/abcdef/", notice, 123)
+        )
+        await service.queue.join()
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+        return notice
+
+    caplog.set_level(logging.INFO, logger="bot")
+    notice = asyncio.run(scenario())
+    final_message = notice.edit_text.await_args.args[0]
+
+    assert "network error" in final_message
+    assert "path-secret" not in final_message
+    assert "query-secret" not in final_message
+    assert "path-secret" not in caplog.text
+    assert "query-secret" not in caplog.text

@@ -23,7 +23,7 @@ A private Telegram bot that downloads E-Hentai/ExHentai gallery archives to a lo
 4. Get the site session cookie via the interactive WebView helper:
 
    ```sh
-   uv run --extra login eh_web_login.py --write-env .env
+   uv run --extra login panda_web_login.py --write-env .env
    ```
 
    Alternatively, sign in via your browser and paste the `Cookie` header into `EH_COOKIE` manually. Cookies expire; rerun the helper when the bot reports an expired session.
@@ -40,14 +40,14 @@ A private Telegram bot that downloads E-Hentai/ExHentai gallery archives to a lo
 docker compose up --build -d
 ```
 
-Compose loads `.env`, mounts `./downloads` at `/downloads`, and runs a hardened container (read-only fs, dropped capabilities, no-new-privileges).
+Compose loads `.env`, stores archives in the Docker-managed `downloads` volume, and runs a hardened container (read-only fs, dropped capabilities, no-new-privileges). The named volume preserves the unprivileged container user's write access.
 
 To run without Compose:
 
 ```sh
 docker build -t panda_downloader .
 docker run -d --name panda_downloader --env-file .env \
-  -e DOWNLOAD_DIR=/downloads -v "$PWD/downloads:/downloads" \
+  -e DOWNLOAD_DIR=/downloads -v panda_downloader-downloads:/downloads \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --cap-drop ALL --security-opt no-new-privileges --init \
   --restart unless-stopped panda_downloader
