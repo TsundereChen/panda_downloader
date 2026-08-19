@@ -69,12 +69,12 @@ container. The container needs only the resulting `EH_COOKIE` value.
 To run without Compose:
 
 ```sh
-docker build -t eh-telegram-archive .
-docker run -d --name eh-telegram-archive --env-file .env \
+docker build -t panda_downloader .
+docker run -d --name panda_downloader --env-file .env \
   -e DOWNLOAD_DIR=/downloads -v "$PWD/downloads:/downloads" \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
   --cap-drop ALL --security-opt no-new-privileges --init \
-  --restart unless-stopped eh-telegram-archive
+  --restart unless-stopped panda_downloader
 ```
 
 ## Use

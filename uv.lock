@@ -110,7 +110,7 @@ wheels = [
 ]
 
 [[package]]
-name = "eh-telegram-archive"
+name = "panda_downloader"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

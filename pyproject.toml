@@ -1,5 +1,5 @@
 [project]
-name = "eh-telegram-archive"
+name = "panda_downloader"
 version = "0.1.0"
 description = "Private Telegram bot for E-Hentai and ExHentai archive downloads"
 readme = "README.md"

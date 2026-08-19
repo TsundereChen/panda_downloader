@@ -1,7 +1,7 @@
 services:
-  eh-telegram-archive:
+  panda_downloader:
     build: .
-    image: eh-telegram-archive:local
+    image: panda_downloader:local
     env_file: .env
     environment:
       DOWNLOAD_DIR: /downloads
