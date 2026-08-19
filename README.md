@@ -1,4 +1,4 @@
-# panda_downloader
+# Panda Downloader
 
 A private Telegram bot that downloads E-Hentai/ExHentai gallery archives to a local folder. Requires a logged-in site session and only responds to allow-listed users in private chats.
 
